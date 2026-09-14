@@ -39,8 +39,10 @@ type ProxyNode struct {
 }
 
 type ProxyGroups struct {
-	Schema string       `json:"schema"`
-	Groups []ProxyGroup `json:"groups"`
+	Revision       *uint64      `json:"revision,omitempty"`
+	SubscriptionID string       `json:"subscription_id,omitempty"`
+	Schema         string       `json:"schema"`
+	Groups         []ProxyGroup `json:"groups"`
 	// DuplicateNames lists distinct names shared by multiple node sources.
 	DuplicateNames []string `json:"duplicate_names,omitempty"`
 }
@@ -122,8 +124,9 @@ type MutationRequest struct {
 }
 
 type ProxySelectionRequest struct {
-	OperationID string `json:"operation_id"`
-	Name        string `json:"name"`
+	OperationID string  `json:"operation_id"`
+	IfRevision  *uint64 `json:"if_revision,omitempty"`
+	Name        string  `json:"name"`
 }
 
 type DelayTestRequest struct {

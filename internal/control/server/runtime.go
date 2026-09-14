@@ -87,6 +87,7 @@ func (s *Server) runtimeRoutes(mux *http.ServeMux) {
 	s.tunRoutes(mux)
 	s.onboardingRoutes(mux)
 	s.loggingRoutes(mux)
+	s.routingRoutes(mux)
 	s.webGUIRoutes(mux)
 	s.serviceRoutes(mux)
 	s.installationRoutes(mux)
@@ -149,7 +150,20 @@ func (s *Server) proxies(writer http.ResponseWriter, request *http.Request) {
 	if !s.requireRuntime(request.Context(), writer) {
 		return
 	}
-	upstream, duplicates, err := s.runtime.ProxyCatalog(request.Context())
+	var upstream mihomo.Proxies
+	var revision *uint64
+	var subscriptionID string
+	var duplicates []string
+	var err error
+	if source, ok := s.runtime.(interface {
+		RoutingProxyCatalog(context.Context) (mihomo.Proxies, []string, uint64, string, error)
+	}); ok {
+		var current uint64
+		upstream, duplicates, current, subscriptionID, err = source.RoutingProxyCatalog(request.Context())
+		revision = &current
+	} else {
+		upstream, duplicates, err = s.runtime.ProxyCatalog(request.Context())
+	}
 	if err != nil {
 		s.writeControlError(request.Context(), writer, err)
 		return
@@ -157,7 +171,7 @@ func (s *Server) proxies(writer http.ResponseWriter, request *http.Request) {
 	// Preserve mihomo/config order: follow GLOBAL.All when present. Do not sort
 	// alphabetically — panel UIs expect subscription default group order.
 	groups := orderedProxyGroups(upstream.Proxies)
-	writeJSON(writer, http.StatusOK, protocol.ProxyGroups{Schema: "mihari/v1", Groups: groups, DuplicateNames: duplicates})
+	writeJSON(writer, http.StatusOK, protocol.ProxyGroups{Schema: "mihari/v1", Groups: groups, Revision: revision, SubscriptionID: subscriptionID, DuplicateNames: duplicates})
 }
 
 func orderedProxyGroups(proxies map[string]mihomo.Proxy) []protocol.ProxyGroup {
@@ -210,7 +224,7 @@ func (s *Server) selectProxy(writer http.ResponseWriter, request *http.Request) 
 		writeInvalidArgument(writer, "proxy name is required")
 		return
 	}
-	if err := s.runtime.SelectProxy(request.Context(), runtimeapi.Operation{ID: body.OperationID, Source: "control"}, request.PathValue("name"), body.Name); err != nil {
+	if err := s.runtime.SelectProxy(request.Context(), runtimeapi.Operation{ID: body.OperationID, Source: "control", IfRevision: body.IfRevision}, request.PathValue("name"), body.Name); err != nil {
 		s.writeControlError(request.Context(), writer, err)
 		return
 	}

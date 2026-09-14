@@ -55,13 +55,16 @@ func TestProviderDelay_ControlPlaneRoutesAndReportsOriginalFailure(t *testing.T)
 	var logs bytes.Buffer
 	redactor := logging.NewRedactor("fixture-secret")
 	reporter := logging.NewDiagnosticReporter(slog.New(slog.NewTextHandler(&logs, nil)), redactor)
-	store := state.NewStore(state.Snapshot{})
+	store := state.NewStore(state.Snapshot{Revision: 7, ActiveSubscription: "provider-profile"})
 	manager := runtime.New(runtime.Options{Store: store, Controller: mihomo.NewClient("http://core.invalid", "fixture-secret", &http.Client{Transport: providerHandlerTransport{upstream}}), DiagnosticReporter: reporter})
 	server := controlserver.New(controlserver.Options{Token: "fixture-token", Store: store, Runtime: manager, DiagnosticReporter: reporter})
 	client := controlclient.NewHTTP("http://control.invalid", "fixture-token", &http.Client{Transport: providerHandlerTransport{server.Handler()}})
 	groups, err := client.ProxyGroups(context.Background())
 	if err != nil || len(groups.DuplicateNames) != 1 || groups.DuplicateNames[0] != "HK" || groups.Groups[0].Nodes[0].Type != "Shadowsocks" || !groups.Groups[0].Nodes[0].UDP {
 		t.Fatalf("incomplete catalog: %#v err=%v", groups, err)
+	}
+	if groups.Revision == nil || *groups.Revision != 7 || groups.SubscriptionID != "provider-profile" {
+		t.Fatal("provider catalog lost routing snapshot identity")
 	}
 	for _, name := range []string{"HK", "DIRECT"} {
 		result, err := client.DelayProxy(context.Background(), name, protocol.DelayTestRequest{})

@@ -19,6 +19,7 @@ const (
 	EventCore          EventKind = "core"
 	EventSubscriptions EventKind = "subscriptions"
 	EventProxies       EventKind = "proxies"
+	EventRouting       EventKind = "routing"
 	EventPreferences   EventKind = "preferences"
 	EventRules         EventKind = "rules"
 	EventRuleProviders EventKind = "rule-providers"
@@ -42,6 +43,7 @@ type Event struct {
 	Core          protocol.CoreStatus
 	Subscriptions protocol.SubscriptionList
 	Proxies       protocol.ProxyGroups
+	Routing       protocol.RoutingStatus
 	Preferences   protocol.TUIPreferences
 	Rules         protocol.RuleList
 	RuleProviders protocol.RuleProviderList
@@ -52,7 +54,7 @@ type Event struct {
 	Memory      protocol.MemorySample
 	Log         protocol.LogEntry
 	Connections protocol.ConnectionList
-	// Epoch is the logging synchronization epoch produced only by Session.
+	// Epoch is the snapshot synchronization epoch produced only by Session.
 	Epoch uint64
 	Err   error
 }
@@ -87,6 +89,8 @@ type Session struct {
 	loggingRevision        *uint64
 	loggingCapability      bool
 	loggingCapabilityKnown bool
+	routingCapability      bool
+	proxiesObserved        bool // current poll already published success or failure
 }
 
 func New(client Client, options Options) *Session {
@@ -190,11 +194,16 @@ func (s *Session) supervise(ctx context.Context) {
 // observed snapshot and retry without changing daemon transport state.
 func (s *Session) poll(ctx context.Context, status protocol.Status) error {
 	err := s.pollSnapshots(ctx, status)
+	if err != nil && !s.proxiesObserved && slices.Contains(status.Capabilities, protocol.CapabilityRouting) {
+		putOrdered(ctx, s.control, Event{Kind: EventProxies, Epoch: s.loggingEpoch, Err: err})
+	}
 	s.pollLogging(ctx, status)
+	s.pollRouting(ctx, status)
 	return err
 }
 
 func (s *Session) pollSnapshots(ctx context.Context, status protocol.Status) error {
+	s.proxiesObserved = false
 	var proxyErr error
 	if slices.Contains(status.Capabilities, protocol.CapabilityCore) {
 		coreStatus, err := s.client.Core(ctx)
@@ -220,9 +229,10 @@ func (s *Session) pollSnapshots(ctx context.Context, status protocol.Status) err
 			return ctx.Err()
 		}
 		proxyErr = err
-		if !putOrdered(ctx, s.control, Event{Kind: EventProxies, Proxies: proxies, Err: err}) {
+		if !putOrdered(ctx, s.control, Event{Kind: EventProxies, Proxies: proxies, Epoch: s.loggingEpoch, Err: err}) {
 			return ctx.Err()
 		}
+		s.proxiesObserved = true
 	}
 	if slices.Contains(status.Capabilities, protocol.CapabilityRules) {
 		rules, err := s.client.Rules(ctx)
@@ -277,10 +287,12 @@ func (s *Session) putStatus(ctx context.Context, status protocol.Status) bool {
 
 func (s *Session) observeLoggingCapability(status protocol.Status) {
 	present := slices.Contains(status.Capabilities, protocol.CapabilityLogging)
-	if s.loggingCapabilityKnown && s.loggingCapability && !present {
+	routing := slices.Contains(status.Capabilities, protocol.CapabilityRouting)
+	if (s.loggingCapabilityKnown && s.loggingCapability && !present) || (s.routingCapability && !routing) {
 		s.loggingEpoch++
 		s.loggingRevision = nil
 	}
+	s.routingCapability = routing
 	s.loggingCapability = present
 	s.loggingCapabilityKnown = true
 }
@@ -311,7 +323,19 @@ func (s *Session) putReconnecting(ctx context.Context, attempt int, err error) b
 	s.loggingRevision = nil
 	s.loggingCapability = false
 	s.loggingCapabilityKnown = false
+	s.routingCapability = false
 	return putOrdered(ctx, s.control, Event{Kind: EventReconnecting, Attempt: attempt, Epoch: s.loggingEpoch, Err: err})
+}
+
+func (s *Session) pollRouting(ctx context.Context, status protocol.Status) {
+	client, ok := s.client.(interface {
+		Routing(context.Context) (protocol.RoutingStatus, error)
+	})
+	if !ok || !slices.Contains(status.Capabilities, protocol.CapabilityRouting) {
+		return
+	}
+	observed, err := client.Routing(ctx)
+	putOrdered(ctx, s.control, Event{Kind: EventRouting, Routing: observed, Epoch: s.loggingEpoch, Err: err})
 }
 
 // superviseStreams keeps the push streams resident for the whole daemon

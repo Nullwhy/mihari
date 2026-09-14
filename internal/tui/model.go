@@ -649,6 +649,9 @@ func (model Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	if Classify(model.width, model.height) == ui.TooSmall {
 		return model, nil
 	}
+	if page, ok := model.pages[model.active].(ui.HelpModeProvider); ok && page.HelpMode() == ui.ModeRouting {
+		return model.dispatchPage(message)
+	}
 	// Digit keys 1–9 jump straight to the matching rail page while the focus is
 	// not in a text input (search box / form). InputText mode passes digits
 	// through to the focused field, so this never fires there. Digits past the
@@ -711,6 +714,9 @@ func (model *Model) applySessionEvent(event session.Event) tea.Cmd {
 		}
 		previousPID := model.status.PID
 		model.status = event.Status
+		if page, ok := model.pages[ui.PageProxies].(*proxypage.Model); ok {
+			page.SetRoutingAvailable(slices.Contains(event.Status.Capabilities, protocol.CapabilityRouting), event.Epoch)
+		}
 		if page, ok := model.pages[ui.PageSetup].(*setuppage.Model); ok {
 			page.ObserveDaemon(model.status, model.core)
 			if model.active == ui.PageSetup && page.WaitingRestart() && !page.Busy() && (statusEpochAdvanced || previousPID != event.Status.PID) {
@@ -762,6 +768,9 @@ func (model *Model) applySessionEvent(event session.Event) tea.Cmd {
 			page.SetSubscriptions(event.Subscriptions)
 		}
 	case session.EventProxies:
+		if model.statusEpochKnown && event.Epoch < model.statusEpoch {
+			break
+		}
 		if page, ok := model.pages[ui.PageProxies].(*proxypage.Model); ok {
 			page.ObserveSnapshot(event.Proxies, event.ObservedAt, event.Err)
 		}
@@ -770,6 +779,14 @@ func (model *Model) applySessionEvent(event session.Event) tea.Cmd {
 			model.proxyNamesPending = append([]string(nil), event.Proxies.DuplicateNames...)
 		}
 		model.showDuplicateNames()
+	case session.EventRouting:
+		if page, ok := model.pages[ui.PageProxies].(*proxypage.Model); ok {
+			if event.Err != nil {
+				page.RoutingUnavailable(event.Epoch)
+			} else {
+				page.SetRouting(event.Routing, event.Epoch)
+			}
+		}
 	case session.EventPreferences:
 		if page, ok := model.pages[ui.PageConnections].(*connectionspage.Model); ok {
 			page.SetPreferences(event.Preferences)
@@ -803,6 +820,10 @@ func (model *Model) applySessionEvent(event session.Event) tea.Cmd {
 		}
 		command = tea.Batch(command, model.loadNetworkStatus())
 	case session.EventReconnecting:
+		if page, ok := model.pages[ui.PageProxies].(*proxypage.Model); ok {
+			page.SetRoutingAvailable(false, event.Epoch)
+			page.InvalidateGroups()
+		}
 		if event.Epoch > model.loggingEpoch {
 			model.resetLogging(event.Epoch)
 		}
@@ -822,6 +843,10 @@ func (model *Model) applySessionEvent(event session.Event) tea.Cmd {
 			page.ResetSession()
 		}
 	case session.EventTerminalError:
+		if page, ok := model.pages[ui.PageProxies].(*proxypage.Model); ok {
+			page.SetRoutingAvailable(false, event.Epoch)
+			page.InvalidateGroups()
+		}
 		model.connected = false
 		model.stale = true
 		model.reconnecting = false
@@ -1113,11 +1138,11 @@ func (model Model) handleActionIntent(intent ui.ActionIntentMsg) (tea.Model, tea
 	if RequiresDaemon(intent.Action) {
 		if !model.mutationsEnabled {
 			model.globalState = ui.StateStale
-			return model, nil
+			return model, intent.Cancel
 		}
 		if intent.Capability != "" && !slices.Contains(model.status.Capabilities, intent.Capability) {
 			model.globalState = ui.StateCapabilityLost
-			return model, nil
+			return model, intent.Cancel
 		}
 	}
 	key := intent.Key

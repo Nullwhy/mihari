@@ -11,6 +11,7 @@ import (
 // ObserveSnapshot keeps the last complete snapshot when a refresh fails.
 func (m *Model) ObserveSnapshot(groups protocol.ProxyGroups, observed time.Time, err error) {
 	if err != nil {
+		m.InvalidateGroups()
 		m.loadError = "Proxy data is unavailable"
 		var api protocol.APIError
 		if errors.As(err, &api) {
