@@ -15,8 +15,11 @@ func TestSubscriptionHelp_FormDoesNotAdvertiseListActions(t *testing.T) {
 	}
 }
 
+// TestSubscriptionHelp_SaveAndCycleBindings checks mode-specific help and footer consistency.
 func TestSubscriptionHelp_SaveAndCycleBindings(t *testing.T) {
 	for _, tc := range []struct{ mode, want, banned string }{
+		{ModeSubscriptionInput, "next field", "refresh all"},
+		{ModeSubscriptionSubmit, "save changes", "next or save"},
 		{ModeSubscriptionCycle, "cycle draft value", "refresh all"},
 		{ModeSubscriptionSaving, "Saving", "Esc cancel"},
 		{ModeSubscriptionUnknown, "confirm before submitting again", "activate"},
@@ -31,7 +34,7 @@ func TestSubscriptionHelp_SaveAndCycleBindings(t *testing.T) {
 	if footer := RenderFooter(PageSubscriptions, ModeSubscriptionSaving, FooterOpt{}); footer != "Saving..." {
 		t.Fatal("saving footer offered input")
 	}
-	for _, mode := range []string{ModeSubscriptionUnknown, ModeSubscriptionWaiting, ModeSubscriptionConfirm, ModeSubscriptionCycle} {
+	for _, mode := range []string{ModeSubscriptionInput, ModeSubscriptionSubmit, ModeSubscriptionUnknown, ModeSubscriptionWaiting, ModeSubscriptionConfirm, ModeSubscriptionCycle} {
 		if RenderFooter(PageSubscriptions, mode, FooterOpt{}) == "" {
 			t.Fatal("missing overlay footer")
 		}

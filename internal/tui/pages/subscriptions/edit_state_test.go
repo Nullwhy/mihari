@@ -42,6 +42,7 @@ func TestDetailStatus_PriorityAndSchedule(t *testing.T) {
 	}
 }
 
+// TestDetailForm_ChangedFieldsAndSaveFocus checks PATCH field selection and Save navigation.
 func TestDetailForm_ChangedFieldsAndSaveFocus(t *testing.T) {
 	f := newEditForm(protocol.Subscription{Name: "Main", Interval: "6h", AutoRefresh: true, ProxyMode: "auto"})
 	req := f.updateRequest("op", 7)
@@ -59,7 +60,9 @@ func TestDetailForm_ChangedFieldsAndSaveFocus(t *testing.T) {
 	for i := 0; i < len(f.inputs); i++ {
 		f.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	}
-	if f.index != len(f.inputs) || !strings.Contains(f.View(), "Save") {
+	m := New(nil, nil, nil)
+	m.openForm(f, "")
+	if f.index != len(f.inputs) || !strings.Contains(m.View(), "[ Save ]") {
 		t.Fatal("Save lacks separate focus")
 	}
 }

@@ -591,6 +591,7 @@ func TestModel_RevisionConflictOnRefreshAllReloads(t *testing.T) {
 	}
 }
 
+// TestModel_FooterHintsAreContextual distinguishes form shortcuts from list shortcuts.
 func TestModel_FooterHintsAreContextual(t *testing.T) {
 	model := New(nil, nil, nil)
 	model.SetSubscriptions(protocol.SubscriptionList{Subscriptions: []protocol.Subscription{{ID: "a", Name: "A"}}})
@@ -603,7 +604,7 @@ func TestModel_FooterHintsAreContextual(t *testing.T) {
 	}
 	model.form = nil
 	model.form = newAddForm()
-	if hints := model.FooterHints(); hints != ui.FormHelp {
+	if hints := model.FooterHints(); hints != ui.RenderFooter(ui.PageSubscriptions, ui.ModeSubscriptionInput, ui.FooterOpt{}) {
 		t.Fatalf("form footer=%q", hints)
 	}
 }

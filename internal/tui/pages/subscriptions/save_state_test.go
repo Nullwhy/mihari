@@ -166,6 +166,7 @@ func TestDetailLayout_FocusedFieldVisible(t *testing.T) {
 	}
 }
 
+// TestDetailLayout_StatusCanScrollIntoView keeps status reachable after field navigation.
 func TestDetailLayout_StatusCanScrollIntoView(t *testing.T) {
 	m := New(nil, nil, nil)
 	m.SetSize(68, 19)
@@ -175,7 +176,7 @@ func TestDetailLayout_StatusCanScrollIntoView(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		m.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
 	}
-	if !strings.Contains(m.View(), "In use:") {
+	if !strings.Contains(m.View(), "In use") && !strings.Contains(m.View(), "Not in use") {
 		t.Fatal("cannot scroll to status")
 	}
 }
