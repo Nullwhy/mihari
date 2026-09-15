@@ -9,6 +9,16 @@ import (
 	"unicode"
 )
 
+// TestRenderHelp_ProxiesExplainsLocate keeps the action and group-header navigation discoverable.
+func TestRenderHelp_ProxiesExplainsLocate(t *testing.T) {
+	body := RenderHelp(PageProxies, "")
+	for _, want := range []string{"Locate", "current", "group header"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("Proxies help missing %q", want)
+		}
+	}
+}
+
 func TestRenderHelp_ShowsOnlyGlobalAndCurrentPage(t *testing.T) {
 	body := RenderHelp(PageProxies, "")
 	if !strings.Contains(body, "Global:") {

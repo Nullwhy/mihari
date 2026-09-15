@@ -84,12 +84,17 @@ func (m *Model) HelpMode() string {
 	}
 	return ""
 }
+
+// FooterHints describes the action available at the current control or overlay.
 func (m *Model) FooterHints() string {
 	if m.routing.open {
 		return ui.RenderFooter(m.ID(), ui.ModeRouting, ui.FooterOpt{})
 	}
 	if m.routing.available && m.routing.focus >= 0 {
 		return "↑/↓ move  Enter select  Esc back  ? help  q quit"
+	}
+	if m.focus.Locate {
+		return "↑/↓ move  ← group  Enter locate  Esc back  ? help  q quit"
 	}
 	return ui.RenderFooter(m.ID(), "", ui.FooterOpt{})
 }
