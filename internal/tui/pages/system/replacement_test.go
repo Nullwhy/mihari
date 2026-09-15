@@ -85,13 +85,14 @@ func TestPreparedConsent_PreparesBeforeDisplayingActualCandidate(t *testing.T) {
 	}
 }
 
+// TestPreparedConsent_CancelAndChannelChangeDiscardCandidate rejects candidates after cancellation, channel changes, or delayed confirmation.
 func TestPreparedConsent_CancelAndChannelChangeDiscardCandidate(t *testing.T) {
 	for _, kind := range []string{"cancel", "channel", "late-confirm"} {
 		t.Run(kind, func(t *testing.T) {
 			m, _ := replacementFixture(t)
 			_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-			msg := cmd().(ui.PageResultMsg)
-			_, cmd = m.Update(msg.Result)
+			msg := firstSystemPageResult(t, cmd)
+			_, cmd = m.Update(msg)
 			intent := cmd().(ui.ActionIntentMsg)
 			switch kind {
 			case "cancel":
@@ -118,6 +119,8 @@ func TestPreparedConsent_CancelAndChannelChangeDiscardCandidate(t *testing.T) {
 		})
 	}
 }
+
+// TestPreparedConsent_RepeatedEnterAndLoadDoNotPrepareAgain prevents duplicate preparation while a download or confirmation is pending.
 func TestPreparedConsent_RepeatedEnterAndLoadDoNotPrepareAgain(t *testing.T) {
 	m, f := replacementFixture(t)
 	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -125,8 +128,8 @@ func TestPreparedConsent_RepeatedEnterAndLoadDoNotPrepareAgain(t *testing.T) {
 	if again != nil {
 		t.Fatal("duplicate preparation while downloading")
 	}
-	msg := cmd().(ui.PageResultMsg)
-	m.Update(msg.Result)
+	msg := firstSystemPageResult(t, cmd)
+	m.Update(msg)
 	_, again = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if again != nil {
 		t.Fatal("duplicate while confirmation queued")
@@ -151,24 +154,44 @@ func (f *cancelReplacementUpdater) Prepare(ctx context.Context, _, _, _ string) 
 	<-f.release
 	return f.prepared, ctx.Err()
 }
+
+// TestPreparedConsent_EscapeCancelsDownloadAndDiscardsLateResult cancels the owned download and rejects its delayed result.
 func TestPreparedConsent_EscapeCancelsDownloadAndDiscardsLateResult(t *testing.T) {
 	m, f := replacementFixture(t)
 	blocking := &cancelReplacementUpdater{replacementUpdater: *f, started: make(chan struct{}), canceled: make(chan struct{}), release: make(chan struct{})}
 	m.selfUpdater = blocking
 	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	result := make(chan tea.Msg, 1)
-	go func() { result <- cmd() }()
+	go func() {
+		var run func(tea.Cmd)
+		run = func(command tea.Cmd) {
+			switch message := command().(type) {
+			case tea.BatchMsg:
+				for _, child := range message {
+					if child != nil {
+						run(child)
+					}
+				}
+			case ui.PageResultMsg:
+				if _, ok := message.Result.(preparedMihariResultMsg); ok {
+					result <- message.Result
+				}
+			}
+		}
+		run(cmd)
+	}()
 	<-blocking.started
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	<-blocking.canceled
 	close(blocking.release)
-	msg := (<-result).(ui.PageResultMsg)
-	_, discard := m.Update(msg.Result)
+	msg := <-result
+	_, discard := m.Update(msg)
 	if _, ok := discard().(ui.DiscardPreparedUpdateMsg); !ok || m.pending {
 		t.Fatal("late download revived canceled update")
 	}
 }
 
+// TestPreparedConsent_OrdinaryUpgradeLabelsActualTargetVersions shows each installed target version without applying downgrade warnings to an upgrade.
 func TestPreparedConsent_OrdinaryUpgradeLabelsActualTargetVersions(t *testing.T) {
 	m, f := replacementFixture(t)
 	preview, err := update.NewReplacementPreview(update.ReplacementCandidate{Version: "v3.0.0", Channel: "main", SHA256: strings.Repeat("a", 64)}, update.ReplacementSnapshot{Targets: []update.ReplacementTarget{
@@ -181,8 +204,8 @@ func TestPreparedConsent_OrdinaryUpgradeLabelsActualTargetVersions(t *testing.T)
 	f.prepared.Preview = preview
 	f.prepared.Version = "v3.0.0"
 	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	message := cmd().(ui.PageResultMsg)
-	_, cmd = m.Update(message.Result)
+	message := firstSystemPageResult(t, cmd)
+	_, cmd = m.Update(message)
 	intent := cmd().(ui.ActionIntentMsg)
 	for _, want := range []string{"binary: v1.0.0", "service: v2.0.0", "v3.0.0"} {
 		if !strings.Contains(intent.Object, want) {

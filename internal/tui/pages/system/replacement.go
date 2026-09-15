@@ -64,6 +64,7 @@ func (m *Model) AcceptsMihariPreparation(key string) bool {
 	return m.pendingPrepared != nil && key == fmt.Sprintf("mihari:update:%d", m.preparationGeneration)
 }
 
+// startMihariPreparation starts owned preparation and its row animation concurrently, invalidating older display checks.
 func (m *Model) startMihariPreparation() tea.Cmd {
 	if m.pending || m.pendingPrepared != nil || m.selfUpdater == nil {
 		return nil
@@ -82,7 +83,7 @@ func (m *Model) startMihariPreparation() tea.Cmd {
 	m.outcomeRow = ""
 	m.outcomeDetail = ""
 	m.lastError = ""
-	return func() tea.Msg {
+	prepare := func() tea.Msg {
 		var p update.PreparedUpdate
 		var err error
 		if elevated == nil || !elevated() {
@@ -92,6 +93,7 @@ func (m *Model) startMihariPreparation() tea.Cmd {
 		}
 		return ui.PageResultMsg{Page: ui.PageSystem, Result: preparedMihariResultMsg{generation: generation, channel: channel, prepared: p, err: err, operation: operation}}
 	}
+	return tea.Batch(prepare, m.rowSpinCmdIfNeeded())
 }
 func (m *Model) handlePreparedMihariResult(msg preparedMihariResultMsg) (ui.Page, tea.Cmd) {
 	if msg.generation != m.preparationGeneration || msg.channel != m.currentMihariChannel() {
