@@ -237,6 +237,27 @@ func TestWebGatewayAuthProxyRejectInstallActivateRollback(t *testing.T) {
 		t.Fatalf("static status=%d body=%s", resp.StatusCode, body)
 	}
 
+	// With a panel active, the browser route must serve SPA content rather than a reveal envelope.
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/subscriptions/one/url", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+webToken)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "panel-v1") || strings.Contains(string(body), `"schema":"mihari/v1"`) {
+		t.Fatalf("browser reveal status=%d", resp.StatusCode)
+	}
+
 	// 5) Install v2, activate, rollback restores previous
 	adapter.build = "v2.0.0"
 	adapter.url = assetServer.URL + "/v2.zip"
