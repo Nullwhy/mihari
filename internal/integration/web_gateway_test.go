@@ -42,6 +42,7 @@ func (a fixturePanelAdapter) ResolveLatest(context.Context) (string, string, err
 }
 
 type trackingController struct {
+	mode     atomic.Value // string
 	selected atomic.Value // string
 	upgrade  atomic.Int64
 	server   *httptest.Server
@@ -52,12 +53,25 @@ func newTrackingController(t *testing.T, secret string) *trackingController {
 	t.Helper()
 	tc := &trackingController{secret: secret}
 	tc.selected.Store("DIRECT")
+	tc.mode.Store("rule")
 	tc.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+secret {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/configs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"mode": tc.mode.Load()})
+		case r.Method == http.MethodPatch && r.URL.Path == "/configs":
+			var patch struct {
+				Mode string `json:"mode"`
+			}
+			if json.NewDecoder(r.Body).Decode(&patch) != nil {
+				http.Error(w, "bad patch", 400)
+				return
+			}
+			tc.mode.Store(patch.Mode)
+			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodGet && r.URL.Path == "/version":
 			_ = json.NewEncoder(w).Encode(map[string]any{"version": "v1.19.0"})
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/upgrade"):
@@ -221,6 +235,27 @@ func TestWebGatewayAuthProxyRejectInstallActivateRollback(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "panel-v1") {
 		t.Fatalf("static status=%d body=%s", resp.StatusCode, body)
+	}
+
+	// With a panel active, the browser route must serve SPA content rather than a reveal envelope.
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/subscriptions/one/url", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+webToken)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "panel-v1") || strings.Contains(string(body), `"schema":"mihari/v1"`) {
+		t.Fatalf("browser reveal status=%d", resp.StatusCode)
 	}
 
 	// 5) Install v2, activate, rollback restores previous

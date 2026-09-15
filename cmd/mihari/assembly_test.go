@@ -111,11 +111,31 @@ func TestDaemonAssembly_RuntimeBuildFailureIsRecordedBeforeDegradedStartup(t *te
 	if !degraded {
 		t.Fatal("runtime build failure did not continue through degraded daemon startup")
 	}
-	if !strings.Contains(records.String(), `"msg":"runtime_build_failed"`) || !strings.Contains(records.String(), "path operation open: permission denied") {
+	if !strings.Contains(records.String(), `"msg":"runtime_build_failed"`) || !strings.Contains(records.String(), "open /private/runtime.yaml: permission denied") {
 		t.Fatalf("runtime build diagnostic=%s", records.String())
 	}
-	if strings.Contains(records.String(), "/private/runtime.yaml") {
-		t.Fatalf("runtime build diagnostic leaked a path: %s", records.String())
+}
+
+func TestDaemonAssembly_PortConflictOnlyOpensRestrictedOnboarding(t *testing.T) {
+	resetDaemonRunSeamsForTest(t)
+	paths := absoluteTempPaths(t)
+	fs, err := platform.NewPrivateFS(paths.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildDaemonRuntime = func(platform.Paths, config.Settings, string, io.Writer, io.Writer, app.RuntimeBuildOptions) (*app.RuntimeAssembly, error) {
+		return nil, &app.ManagedPortConflict{}
+	}
+	var recovered bool
+	runDaemon = func(_ context.Context, options daemon.Options) error {
+		recovered = options.Onboarding != nil && options.Runtime == nil && options.Store.Load().Health == "degraded"
+		return nil
+	}
+	if err := runDaemonWith(context.Background(), daemonRunDeps{Paths: paths, PrivateFS: fs, Version: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if !recovered {
+		t.Fatal("confirmed port conflict did not expose restricted onboarding")
 	}
 }
 

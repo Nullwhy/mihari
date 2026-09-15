@@ -64,6 +64,7 @@ func (m *Model) AcceptsMihariPreparation(key string) bool {
 	return m.pendingPrepared != nil && key == fmt.Sprintf("mihari:update:%d", m.preparationGeneration)
 }
 
+// startMihariPreparation starts owned preparation and its row animation concurrently, invalidating older display checks.
 func (m *Model) startMihariPreparation() tea.Cmd {
 	if m.pending || m.pendingPrepared != nil || m.selfUpdater == nil {
 		return nil
@@ -82,7 +83,7 @@ func (m *Model) startMihariPreparation() tea.Cmd {
 	m.outcomeRow = ""
 	m.outcomeDetail = ""
 	m.lastError = ""
-	return func() tea.Msg {
+	prepare := func() tea.Msg {
 		var p update.PreparedUpdate
 		var err error
 		if elevated == nil || !elevated() {
@@ -92,6 +93,7 @@ func (m *Model) startMihariPreparation() tea.Cmd {
 		}
 		return ui.PageResultMsg{Page: ui.PageSystem, Result: preparedMihariResultMsg{generation: generation, channel: channel, prepared: p, err: err, operation: operation}}
 	}
+	return tea.Batch(prepare, m.rowSpinCmdIfNeeded())
 }
 func (m *Model) handlePreparedMihariResult(msg preparedMihariResultMsg) (ui.Page, tea.Cmd) {
 	if msg.generation != m.preparationGeneration || msg.channel != m.currentMihariChannel() {
@@ -133,7 +135,7 @@ func (m *Model) confirmPreparedMihariUpdate(p update.PreparedUpdate) tea.Cmd {
 	}
 	object := fmt.Sprintf("Mihari %s → %s", strings.Join(versions, "; "), valueOr(p.Preview.Candidate.Version, ui.UnknownLabel))
 	return func() tea.Msg {
-		return ui.ActionIntentMsg{Action: ui.ActionUpdateMihari, Page: ui.PageSystem, Key: fmt.Sprintf("mihari:update:%d", generation), Title: ui.UpdateMihariTitle, Object: object, Impact: impact, Rollback: ui.UpdateMihariRollback,
+		return ui.ActionIntentMsg{Action: ui.ActionUpdateMihari, Page: ui.PageSystem, Key: fmt.Sprintf("mihari:update:%d", generation), Title: ui.UpdateMihariTitle, Object: object, Impact: impact, Rollback: ui.UpdateMihariRollback, MihariUpdate: mihariUpdateConfirmation(p.Preview),
 			Execute: func() tea.Msg {
 				p.Consent = update.ReplacementConsent{Yes: true, ExpectedPreview: p.Preview.ID}
 				return preparedMihariConfirmedMsg{generation: generation, prepared: p}
@@ -142,4 +144,53 @@ func (m *Model) confirmPreparedMihariUpdate(p update.PreparedUpdate) tea.Cmd {
 				return ui.PageResultMsg{Page: ui.PageSystem, Result: preparedMihariCanceledMsg{generation: generation, prepared: p}}
 			}}
 	}
+}
+
+func mihariUpdateConfirmation(p update.ReplacementPreview) *ui.MihariUpdateConfirmation {
+	content := &ui.MihariUpdateConfirmation{
+		TargetVersion: p.Candidate.Version, Risk: p.Risk,
+		AfterConfirmation: ui.UpdateAfterStandalone,
+	}
+	missingVersion := false
+	for _, target := range p.Snapshot.Targets {
+		roles := make([]string, 0, len(target.Roles))
+		for _, role := range target.Roles {
+			switch role {
+			case "binary":
+				roles = append(roles, "Binary")
+			case "service":
+				roles = append(roles, "Service")
+				// The role means a registered service; Exists only describes its binary.
+				content.AfterConfirmation = ui.UpdateAfterService
+			case "path":
+				roles = append(roles, "Path")
+			case "managed":
+				roles = append(roles, "Managed")
+			}
+		}
+		version := ui.MihariInstalledVersion{Role: valueOr(strings.Join(roles, " / "), "Mihari"), Version: target.Version}
+		switch {
+		case !target.Exists:
+			version.Version = "Not installed"
+		case target.Version == "":
+			version.Unknown = true
+			version.Version = ui.UnknownLabel
+			if target.UnrecognizedVersion != "" {
+				version.Version += "[" + target.UnrecognizedVersion + "]"
+			} else {
+				missingVersion = true
+			}
+		}
+		content.Installed = append(content.Installed, version)
+	}
+	switch p.Risk {
+	case update.ReplacementUnknown:
+		content.Compatibility = ui.UpdateUnknownBuild
+		if missingVersion {
+			content.Compatibility = ui.UpdateUnknownVersion
+		}
+	case update.ReplacementDowngrade:
+		content.Compatibility = ui.UpdateDowngradeCompatibility
+	}
+	return content
 }

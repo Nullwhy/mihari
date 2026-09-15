@@ -53,6 +53,8 @@ const (
 	loadStale
 	loadFailed
 	loadLive
+	loadOutdated
+	loadExpired
 )
 
 type row struct {
@@ -121,7 +123,7 @@ func phaseTone(phase loadPhase) ui.StatusTone {
 		return ui.TonePositive
 	case loadFailed:
 		return ui.ToneNegative
-	case loadCached, loadMissing, loadStale, loadFetching, loadApplying, loadWorking:
+	case loadCached, loadMissing, loadStale, loadOutdated, loadExpired, loadFetching, loadApplying, loadWorking:
 		return ui.ToneCaution
 	default:
 		return ui.ToneNeutral
@@ -149,9 +151,18 @@ func resolveLoadPhase(subscription protocol.Subscription, active bool, pending s
 	if !subscription.Cached {
 		return loadMissing
 	}
+	if subscription.CacheOutdated {
+		return loadOutdated
+	}
+	if subscription.IntervalRefreshRequired {
+		return loadExpired
+	}
 	interval := effectiveInterval(subscription.Interval, globalInterval)
 	stale := !subscription.UpdatedAt.IsZero() && interval > 0 && !now.Before(subscription.UpdatedAt.Add(interval))
 	if stale {
+		if subscription.AutoRefresh {
+			return loadExpired
+		}
 		return loadStale
 	}
 	if active {
@@ -175,7 +186,11 @@ func loadPhaseLabel(phase loadPhase, clock time.Time) (label string, spinning bo
 	case loadMissing:
 		return ui.LoadMissingState, false
 	case loadStale:
-		return ui.LoadStaleState, false
+		return "Need refresh", false
+	case loadOutdated:
+		return "Outdated", false
+	case loadExpired:
+		return "Expired", false
 	case loadFailed:
 		return ui.LoadFailedState, false
 	default:
@@ -212,27 +227,37 @@ func rowFrom(subscription protocol.Subscription, active bool, pending string, no
 	}
 }
 
-type detailState struct{ subscription protocol.Subscription }
-
 type Model struct {
-	client         Client
-	newOperationID func() string
-	now            func() time.Time
-	subscriptions  []protocol.Subscription
-	activeID       string
-	globalInterval string
-	revision       uint64
-	focus          pageFocus
-	pending        map[string]string
-	form           *formModel
-	formID         string
-	formRevision   uint64
-	detail         *detailState
-	lastError      string
-	width          int
-	height         int
-	theme          ui.Theme
-	contentFocused bool
+	client             Client
+	newOperationID     func() string
+	now                func() time.Time
+	subscriptions      []protocol.Subscription
+	activeID           string
+	globalInterval     string
+	revision           uint64
+	focus              pageFocus
+	pending            map[string]string
+	form               *formModel
+	formID             string
+	formRevision       uint64
+	dialogEpoch        uint64
+	saveState          savePhase
+	saveOperation      string
+	confirmYes         bool
+	dialogNote         string
+	dialogScroll       int
+	dialogManualScroll bool
+	revealCancel       context.CancelFunc
+	queryCancel        context.CancelFunc
+	querySeq           uint64
+	disconnected       bool
+	connectionEpoch    uint64
+	saveCancel         context.CancelFunc
+	lastError          string
+	width              int
+	height             int
+	theme              ui.Theme
+	contentFocused     bool
 	// loadSpinClock advances braille frames while any row has in-flight work.
 	loadSpinClock time.Time
 	loadSpinning  bool
@@ -306,7 +331,12 @@ func (m *Model) ID() ui.PageID { return ui.PageSubscriptions }
 // SetContentFocused reports whether the root shell has given keyboard focus to this page.
 func (m *Model) SetContentFocused(focused bool) { m.contentFocused = focused }
 
-func (m *Model) SetSize(width, height int) { m.width, m.height = width, height }
+func (m *Model) SetSize(width, height int) {
+	m.width, m.height = width, height
+	if m.form != nil && m.saveState == saveEditing {
+		m.ensureFormFocus()
+	}
+}
 
 func (m *Model) layoutWidth() int {
 	if m.width > 0 {
@@ -324,6 +354,7 @@ func (m *Model) FocusFirst() {
 	}
 }
 
+// SetSubscriptions refreshes catalog state while preserving form drafts and manual scrolling.
 func (m *Model) SetSubscriptions(result protocol.SubscriptionList) {
 	previousIndex := m.index(m.focus.id)
 	m.subscriptions = append([]protocol.Subscription(nil), result.Subscriptions...)
@@ -335,11 +366,20 @@ func (m *Model) SetSubscriptions(result protocol.SubscriptionList) {
 			m.focus = pageFocus{kind: focusRow, id: m.subscriptions[min(max(0, previousIndex), len(m.subscriptions)-1)].ID}
 		}
 	}
+	if m.form != nil && m.saveState == saveEditing && !m.dialogManualScroll {
+		m.ensureFormFocus()
+	}
 }
 
 func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
+	if handled, cmd := m.updateDialogMessage(message); handled {
+		return m, cmd
+	}
 	switch typed := message.(type) {
 	case mutationResultMsg:
+		if m.form != nil && m.saveState == saveSending && typed.operation.ID == m.saveOperation {
+			return m, m.finishSave(typed)
+		}
 		delete(m.pending, typed.id)
 		delete(m.pending, "__add")
 		if typed.err != nil {
@@ -414,12 +454,6 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 	}
 
 	key, ok := message.(tea.KeyPressMsg)
-	if m.detail != nil {
-		if ok && (key.String() == "esc" || key.String() == "enter") {
-			m.detail = nil
-		}
-		return m, nil
-	}
 	if m.form != nil {
 		return m.updateForm(message)
 	}
@@ -427,8 +461,7 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 		return m, nil
 	}
 	if key.String() == "a" {
-		m.form, m.formID, m.formRevision = newAddForm(), "", m.revision
-		return m, func() tea.Msg { return ui.InputModeMsg{Mode: ui.InputText} }
+		return m, m.openForm(newAddForm(), "")
 	}
 	index := m.index(m.focus.id)
 	switch key.String() {
@@ -444,12 +477,7 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 		}
 	case "enter":
 		if index >= 0 {
-			m.detail = &detailState{subscription: m.subscriptions[index]}
-		}
-	case "e":
-		if index >= 0 {
-			m.form, m.formID, m.formRevision = newEditForm(m.subscriptions[index]), m.subscriptions[index].ID, m.revision
-			return m, func() tea.Msg { return ui.InputModeMsg{Mode: ui.InputText} }
+			return m, m.openForm(newEditForm(m.subscriptions[index]), m.subscriptions[index].ID)
 		}
 	case "space":
 		if index >= 0 {
@@ -497,9 +525,7 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 func (m *Model) HelpMode() string {
 	switch {
 	case m.form != nil:
-		return ui.ModeForm
-	case m.detail != nil:
-		return ui.ModeDetail
+		return m.formHelpMode()
 	default:
 		return ""
 	}
@@ -507,19 +533,30 @@ func (m *Model) HelpMode() string {
 
 // FooterHints returns contextual shortcuts for the root shell footer.
 func (m *Model) FooterHints() string {
+	if m.form != nil {
+		return m.formFooter()
+	}
 	return ui.RenderFooter(m.ID(), m.HelpMode(), ui.FooterOpt{})
 }
 
 // subscriptionColumns is the checked table definition (design S1 table):
 // name is highest priority, nextRefresh drops first.
 func (m *Model) subscriptionColumns() []ui.TableColumn {
+	// Grow only to the content's visible width, leaving surplus space on the
+	// right instead of pushing related fields apart on wide terminals.
+	nameWidth, trafficWidth := 10, 11
+	for _, subscription := range m.subscriptions {
+		nameWidth = max(nameWidth, lipgloss.Width(subscription.Name))
+		traffic := ui.FormatSubscriptionTrafficCompact(subscription.Upload, subscription.Download, subscription.Total)
+		trafficWidth = max(trafficWidth, lipgloss.Width(traffic))
+	}
 	return []ui.TableColumn{
-		{ID: "name", Title: ui.NameLabel, MinWidth: 10, Flex: 3, Priority: 8},
-		{ID: "active", Title: ui.ActiveLabel, MinWidth: 6, Flex: 0, Priority: 7},
-		{ID: "state", Title: "State", MinWidth: 8, Flex: 0, Priority: 6},
-		{ID: "load", Title: ui.LoadLabel, MinWidth: 9, Flex: 0, Priority: 5},
-		{ID: "proxy", Title: "Proxy", MinWidth: 6, Flex: 0, Priority: 4},
-		{ID: "traffic", Title: ui.TrafficLabel, MinWidth: 11, Flex: 1, Priority: 3},
+		{ID: "name", Title: ui.NameLabel, MinWidth: 10, MaxWidth: min(nameWidth, 32), Flex: 3, Priority: 8},
+		{ID: "active", Title: "InUse", MinWidth: 5, Flex: 0, Priority: 7, Align: ui.AlignCenter},
+		{ID: "state", Title: "Enabled", MinWidth: 8, Flex: 0, Priority: 6},
+		{ID: "load", Title: "Status", MinWidth: 12, Flex: 0, Priority: 5},
+		{ID: "proxy", Title: "Mode", MinWidth: 6, Flex: 0, Priority: 4},
+		{ID: "traffic", Title: ui.TrafficLabel, MinWidth: 11, MaxWidth: min(trafficWidth, 24), Flex: 1, Priority: 3},
 		{ID: "lastSuccess", Title: ui.LastUpdateLabel, MinWidth: 11, Flex: 0, Priority: 2},
 		{ID: "nextRefresh", Title: ui.NextUpdateLabel, MinWidth: 11, Flex: 0, Priority: 1},
 	}
@@ -574,46 +611,74 @@ func (m *Model) View() string {
 		if m.form.kind == formEdit {
 			formTitle = ui.EditSubscriptionTitle
 		}
-		content = m.modal(formTitle, m.form.View()+"\n\n"+ui.FormHelp)
-	} else if m.detail != nil {
-		content = m.modal(ui.SubscriptionDetailsTitle, m.detailView())
+		content = m.formView(formTitle)
 	}
 	return content
 }
 
+// updateForm routes editing, scrolling, and submission while keeping feedback visible.
 func (m *Model) updateForm(message tea.Msg) (ui.Page, tea.Cmd) {
+	if m.saveState != saveEditing {
+		return m, m.updateSaveKeys(message)
+	}
 	key, isKey := message.(tea.KeyPressMsg)
 	if isKey && key.String() == "enter" {
-		if m.form.index+1 < len(m.form.inputs) {
-			return m, m.form.move(1)
+		if m.form.index < len(m.form.inputs) {
+			cmd := m.form.move(1)
+			m.ensureFormFocus()
+			return m, cmd
 		}
-		if !m.form.valid() || m.client == nil {
-			m.lastError = ui.InvalidSubscriptionForm
+		if !m.form.valid() {
+			m.ensureFormFocus()
+			return m, nil
+		}
+		if m.client == nil {
 			return m, nil
 		}
 		form, id, revision := m.form, m.formID, m.formRevision
-		m.form, m.formID, m.formRevision = nil, "", 0
-		return m, tea.Batch(func() tea.Msg { return ui.InputModeMsg{Mode: ui.InputNavigation} }, m.submitForm(form, id, revision))
+		if form.kind == formEdit && emptyPatch(form.updateRequest("", revision)) {
+			return m, m.closeForm()
+		}
+		return m, m.submitForm(form, id, revision)
 	}
+	if isKey && key.String() == "pgup" {
+		m.dialogManualScroll = true
+		m.dialogScroll = max(0, m.dialogScroll-3)
+		return m, nil
+	}
+	if isKey && key.String() == "pgdown" {
+		m.dialogManualScroll = true
+		m.dialogScroll += 3
+		return m, nil
+	}
+	oldIndex := m.form.index
 	closed, command := m.form.Update(message)
+	if oldIndex != m.form.index {
+		m.ensureFormFocus()
+	}
 	if closed {
-		m.form, m.formID, m.formRevision = nil, "", 0
-		return m, func() tea.Msg { return ui.InputModeMsg{Mode: ui.InputNavigation} }
+		return m, m.closeForm()
 	}
 	return m, command
 }
 
 func (m *Model) submitForm(form *formModel, id string, revision uint64) tea.Cmd {
 	operationID := m.newOperationID()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if m.form == form {
+		m.saveCancel = cancel
+		m.saveState = saveSending
+		m.saveOperation = operationID
+		m.dialogNote = "Saving..."
+		m.form.errorText = ""
+	}
 	if form.kind == formAdd {
 		m.pending["__add"] = "add"
 		request := form.addRequest(operationID, revision)
 		operation := logging.OperationMetadata{ID: operationID, Name: "subscription.add"}
 		return tea.Batch(func() tea.Msg {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			ctx = logging.WithOperation(ctx, operation)
-			result, err := m.client.AddSubscription(ctx, request)
+			result, err := m.client.AddSubscription(logging.WithOperation(ctx, operation), request)
 			return mutationResultMsg{kind: mutationAdd, result: result, operation: operation, err: err}
 		}, m.loadSpinCmdIfNeeded())
 	}
@@ -621,10 +686,8 @@ func (m *Model) submitForm(form *formModel, id string, revision uint64) tea.Cmd 
 	request := form.updateRequest(operationID, revision)
 	operation := logging.OperationMetadata{ID: operationID, Name: "subscription.set"}
 	return tea.Batch(func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		ctx = logging.WithOperation(ctx, operation)
-		result, err := m.client.UpdateSubscription(ctx, id, request)
+		result, err := m.client.UpdateSubscription(logging.WithOperation(ctx, operation), id, request)
 		return mutationResultMsg{kind: mutationUpdate, id: id, result: result, operation: operation, err: err}
 	}, m.loadSpinCmdIfNeeded())
 }
@@ -836,55 +899,24 @@ func (m *Model) index(id string) int {
 	return -1
 }
 
-func (m *Model) detailView() string {
-	subscription := m.detail.subscription
-	errorState := ui.MissingValue
-	if subscription.LastError != "" {
-		errorState = subscription.LastError
-	}
-	phase := resolveLoadPhase(subscription, subscription.ID == m.activeID, m.pending[subscription.ID], m.now(), m.globalInterval)
-	load, _ := loadPhaseLabel(phase, m.now())
-	traffic := ui.FormatSubscriptionTraffic(subscription.Upload, subscription.Download, subscription.Total)
-	if traffic == "" {
-		traffic = ui.MissingValue
-	}
-	// Status / Load / Last-error values carry a tone color; the rest stays plain.
-	statusValue := ui.ToneStyle(m.theme, ui.ClassifyStatusTone(enabledLabel(subscription.Enabled))).Render(enabledLabel(subscription.Enabled))
-	loadValue := ui.ToneStyle(m.theme, phaseTone(phase)).Render(load)
-	errorTone := ui.ToneNeutral
-	if subscription.LastError != "" {
-		errorTone = ui.ToneNegative
-	}
-	errorValue := ui.ToneStyle(m.theme, errorTone).Render(errorState)
-	next := nextRefreshLabel(subscription, m.now(), m.globalInterval)
-	return fmt.Sprintf("%s: %s\n%s: %s\n%s: %t\n%s: %s\n%s: %s\n%s: %t\n%s: %s\n%s: %s\n%s: %s\n%s: %s\n\n%s",
-		ui.NameLabel, subscription.Name,
-		ui.StatusLabel, statusValue,
-		ui.AutoRefreshLabel, subscription.AutoRefresh,
-		ui.LoadLabel, loadValue,
-		ui.TrafficLabel, traffic,
-		ui.CacheLabel, subscription.Cached,
-		ui.IntervalLabel, valueOr(subscription.Interval, ui.GlobalLabel),
-		ui.LastUpdateLabel, formatTimestamp(subscription.UpdatedAt),
-		ui.NextUpdateLabel, next,
-		ui.LastErrorLabel, errorValue,
-		ui.EscCloseHint)
-}
-
 // nextRefreshLabel predicts the next refresh from UpdatedAt + effective
 // interval, mirroring the list column semantics.
 func nextRefreshLabel(subscription protocol.Subscription, now time.Time, globalInterval string) string {
 	interval := effectiveInterval(subscription.Interval, globalInterval)
-	stale := !subscription.UpdatedAt.IsZero() && interval > 0 && !now.Before(subscription.UpdatedAt.Add(interval))
+	base := subscription.UpdatedAt
+	if !subscription.ScheduleFrom.IsZero() {
+		base = subscription.ScheduleFrom
+	}
+	stale := !base.IsZero() && interval > 0 && !now.Before(base.Add(interval))
 	switch {
 	case !subscription.Enabled:
 		return ui.DisabledLabel
 	case !subscription.AutoRefresh:
 		return ui.ManualLabel
-	case stale || subscription.LastError != "" || subscription.UpdatedAt.IsZero():
+	case stale || base.IsZero():
 		return ui.RetryPendingLabel
 	case interval > 0:
-		return relativeTime(now, subscription.UpdatedAt.Add(interval))
+		return relativeTime(now, base.Add(interval))
 	default:
 		return ui.ManualLabel
 	}
@@ -897,15 +929,7 @@ func subscriptionErrorMessage(err error) string {
 	if errors.As(err, &apiError) && strings.TrimSpace(apiError.Message) != "" {
 		return apiError.Message
 	}
-	if err != nil && strings.TrimSpace(err.Error()) != "" {
-		return err.Error()
-	}
 	return ui.SubscriptionOperationFailed
-}
-
-func (m *Model) modal(title, body string) string {
-	content := m.theme.Dialog.Width(min(72, max(36, m.width-6))).Render(m.theme.Title.Render(title) + "\n\n" + body)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
 }
 
 func effectiveInterval(value, global string) time.Duration {
@@ -949,18 +973,12 @@ func enabledLabel(enabled bool) string {
 	return ui.DisabledLabel
 }
 
+// formatTimestamp displays local minute precision, or a missing marker for zero time.
 func formatTimestamp(value time.Time) string {
 	if value.IsZero() {
 		return ui.MissingValue
 	}
-	return value.Local().Format(time.RFC3339)
-}
-
-func valueOr(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
+	return value.Local().Format("2006-01-02 15:04")
 }
 
 var fallbackOperationID atomic.Uint64

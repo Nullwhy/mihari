@@ -27,6 +27,14 @@ Mihari 围绕一个由守护进程持有的控制面(control plane)设计,由 CL
 
 ## 诊断错误链
 
+本节后续 Phase 表格保留先前诊断建设的历史审计记录。其中“脱敏摘要”“取消静默”“预期拒绝 DEBUG”等旧策略由[完整错误日志设计](superpowers/specs/2026-09-14-full-error-logging-design.md)替代，实施与验证证据见[模块登记](superpowers/plans/2026-09-14-full-error-logging-audit.md)。
+
+- 文件日志、快照与导出保留原始 cause、包装上下文、合并原因及已有堆栈，不脱敏。普通 API、状态、事件、CLI JSON 与独立终端 FailureReporter 保留各自的输出边界；日志原文仅经既有授权日志快照协议传输。
+- 仅使用已建立且可用的文件 reporter；普通 CLI 不新建或探测日志。预期拒绝与主动取消 INFO、重试与恢复 warning WARN、最终失败 ERROR，遵循配置过滤；实际执行 owner 去重，缓存重放不再报告。
+- 诊断文本、HTTP 失败正文与核心逻辑行各限 256 KiB。保留错误图预算及截断标记；最坏 JSON 转义采用 UTF-8 分片，适配既有 1 MiB record / 2 MiB frame。快照校验、摘要、来源范围、权限与业务提交语义保持。
+- Issue #204 的专用内部 HTTP cause 保留真实状态、失败阶段、URL、失败正文与原始报错。成功响应正文不转储。导出前与完成页面红色说明日志未经脱敏，不增加确认步骤或额外配置文件。
+- provider 读取由 Manager 编排，最多三次，单次最多 1 秒、该读取总计最多 4 秒，退避可取消；普通节点查询不增加这项预算。原始全局节点映射用于测速路由，合并后的目录仅供展示。普通节点优先，否则按 provider 名排序选择首个候选；Compatible 投影不重复计数。
+- `/v1/proxies` 成功响应增加可选 `duplicate_names`；失败不发布残缺目录。TUI 的启动首次成功完整检查消费一次同名提示机会；错误快照保留旧数据并标记过期，恢复后清除加载错误。原始原因、重试进度和来源身份不加入公开 DTO。
 - Phase 1 的 operation metadata 已用于 Phase 2 的 Logging 更新链路和 Phase 3 的主要业务 mutation。CLI/TUI 生成 ID，既有 `/v1` mutation DTO 携带 `operation_id`，本地控制客户端、控制服务器和 daemon 在各自的诊断 ctx 中绑定同一 ID 与静态 operation 名；没有增加 header 或持久化状态。一个实际 mutation 执行使用一个 ID；订阅 Add 后的立即拉取是独立子操作，批量 provider 更新的每个子操作也保留各自既有 ID。
 - settings 保存失败保留稳定的公开 `data_failure` / `persist settings` 分类，同时在内部错误链保留 cause，供 `errors.Is`/`errors.As` 与 daemon 的受控诊断使用。诊断 logger 输出有界、脱敏的类型化摘要，不能把路径、凭据、完整 URL 或配置原文带入公开响应、状态或事件。
 - 每次实际 mutation 执行是详细失败诊断的唯一 owner；同一 key 的缓存重放和并发等待者不会重复记录。控制服务器只为未被 owner 标记的意外失败补一条记录。对这条 settings 链路，已提交后的目录同步 warning 保持成功、revision 与内存发布，并在业务锁释放后以实际原因记录 WARN。
@@ -90,29 +98,47 @@ Phase 4 保留几条明确边界：认证前、预解析和只读请求没有统
 - 搜索与表单字段中的括号粘贴和 Ctrl+V 使用纯 Go 实现的 `github.com/atotto/clipboard` 辅助库;Mihari 本身从不把密钥写入剪贴板。
 - 页面:独立的首次运行 Setup 路由、Overview、可展开的 Proxies、带本地 GeoIP 详情的活动/已关闭 Connections、Rules/Providers、有界的结构化 Logs 流、订阅管理表单、分类的 System 页面,以及驱动面板安装/更新/激活/打开/回滚的 Web GUI 页面(在守护进程通告 `web-gui` 能力之后)。
 - Setup 安装核心、可添加初始订阅、准备本地 GeoIP 数据,并请求守护进程持久化校验过的本地端点。
-- Setup 第一步用短连接 `net.Listen` 预检三个托管端口的可用性:占用端口标红(Danger)并提供一键自动切换到下一个可用端口(从 `port+1` 起搜索,上限 `+1024`,三端口保持互异);权限等未知错误不标红、不阻塞,仍由守护进程启动时兜底校验。预检以 generation 守卫拒绝迟到的探测结果。
-- 进入 core / GeoIP 步骤时,Setup 经只读 `GET /v1/core`、`GET /v1/geoip/status` 探测本地资源就绪:已就绪显示版本并提示「将直接使用、无需下载」,失败回退静态文案且绝不阻塞流程。
-- Setup 审查页汇总端口(改端口且守护进程报告需重启时标注「需重启生效」)/ core 来源与版本(本地已有/新装/安装失败)/ 订阅 / GeoIP / mihari 服务注册状态(经 `GET /v1/service/status` 拉取);跳过项如实标注。各步结果在命令闭包内回写 Model,依赖 Bubble Tea 的 cmd→channel→Update happens-before 保证。
+- Setup 端口预检复用 PID owner 分类，区分本实例占用、确认的外部冲突、可用与未知；仅外部冲突允许自动建议新端口。搜索最多 `+1024`，不越过 65535，预留其他字段的端口，generation 守卫拒绝迟到探测结果。
+- Setup 使用共享 Theme 的分步固定布局，按动作显示动态等待与耗时。异步命令只返回结果，页面字段仅在 Update 中发布；错误详情使用安全消息和白名单诊断字段，可滚动、复制，不公开内部 cause。
+- 每步经 daemon 提交，端口确认时 PATCH onboarding（Complete=nil），随后等待重启生效。最终 Review 只结束引导，不重交端口。SetupRequired 根据端口生效状态与核心资源判断，历史 Complete、可选订阅和 GeoIP 不再独自决定是否进入向导。读取失败不等于核心缺失；已有订阅自动略过，注册后首次下载失败重试同一 ID 的 refresh。
+- 仅已确认的启动端口占用可开放 daemon 内部受限 onboarding 适配器，复用 Manager 的校验和原子设置事务。健康仍为 degraded，不挂载完整 RuntimeAPI；不扩大权限错误、安装事务失败等场景的可写边界。当前服务适配器不提供实例身份，端口保存后提供手动重启及重连检查，不自动操作无法核对身份的服务。
+- 新增认证只读 `GET /v1/operations/{operation_id}`（能力 `operation-status-v1`）：响应 schema、operation_id、state（running/finished/unknown），不返回请求体或内部原因。内存最多保留 256 条固定长度摘要键记录，饱和时保守 unknown；重启/淘汰亦为 unknown。覆盖 setup 的 core install、GeoIP update、onboarding update、订阅 add（含首次刷新）及 profile mutation 的完整 handler 生命周期；同 ID 所有 handler 收尾后才可能 finished。finished 不代表业务成功，取消后仍读取对应领域状态；查询绝不重放 mutation。
 - System 页面通过与 `mihari service` 相同的本地服务适配器管理 OS 服务(安装/卸载/启动/停止/重启/状态);这些操作要求进程已经提权,且不经过守护进程控制协议。当守护进程通告相应能力时,System 页面显示实时的系统代理与 TUN 状态,并通过本地控制 API 切换它们(开启外部代理或其他 TUN / mihomo 实例需要强制确认;Mihari 从不清除其他产品的代理)。
 - System 页面的 Ports Config 可修改 Mixed / Controller / Web 端口;占用按本实例 PID 显示 `Owned`,或 `Occupied by name (pid)` / `Available`。写入复用 onboarding 更新,应用后通常 `RestartRequired`。没有对应 CLI。
 - System 页面的 Logging 区可修改 daemon-owned 的 level、最大文件大小与保留数量；更新经稳定的 `/v1/logging` 控制协议热应用，不需要 daemon restart。Logs 页的 `e` 与 System → Logging 的 **Export logs** 打开同一个本地导出对话框；导出不增加 CLI 命令；Unix 系统模式使用可选的 machine-log-snapshot-v1 控制协议。
-- System 页面还在进入时以只读方式检查 Mihari 的最新 GitHub Release,并用 `当前版本 · 最新版本 available`、`当前版本 · Up to date` 或 `ahead of <channel> <latest>` 展示结果。实际更新先准备固定候选，再按真实目标版本确认；降级及未知兼容性显示完整风险。确认后，本地 updater 在控制协议之外复核候选、目标和服务定义，替换 Mihari 可执行文件并尝试同步已安装服务；该写操作要求 TUI 进程已经具备管理员/root 权限,不会自动触发 UAC 或 sudo。旧 Bubble Tea 程序先关闭工作、IPC、日志与文件所有者并恢复终端，再提交和进入新 TUI。取消与迟到准备结果由 Run 所有者清理。Unix 复用安装锁，Windows 在主程序替换、服务停止及服务副本复制边界复核；后续同步失败保留主程序已更新的部分成功状态。预览只在本次调用中存在，跨 Unix helper 调用用不透明 preview_id 绑定，不改变 daemon /v1、安装请求或 journal 格式。
+- System 页面还在进入时以只读方式检查 Mihari 的最新 GitHub Release,并用 `当前版本 · 最新版本 available`、`当前版本 · Up to date` 或 `ahead of <channel> <latest>` 展示结果。实际更新先准备固定候选，再按真实目标版本确认；确定降级保留完整风险；未知兼容性使用简短英文说明。更新确认专用布局保留可信已安装副本的安全非标准标识 `Unknown[label]`，按副本展示，支持正文滚动且默认取消；该内部显示证据不进入版本比较、preview ID、CLI/JSON、日志或持久化。确认后，本地 updater 在控制协议之外复核候选、目标和服务定义，替换 Mihari 可执行文件并尝试同步已安装服务；该写操作要求 TUI 进程已经具备管理员/root 权限,不会自动触发 UAC 或 sudo。旧 Bubble Tea 程序先关闭工作、IPC、日志与文件所有者并恢复终端，再提交和进入新 TUI。取消与迟到准备结果由 Run 所有者清理。Unix 复用安装锁，Windows 在主程序替换、服务停止及服务副本复制边界复核；后续同步失败保留主程序已更新的部分成功状态。预览只在本次调用中存在，跨 Unix helper 调用用不透明 preview_id 绑定，不改变 daemon /v1、安装请求或 journal 格式。
+- Windows 更新预览对管理员执行检查未通过的用户目录目标，增加同一用户的降权版本查询：持有并验证调用者关联的非管理员 UAC primary token，核对用户 SID、会话、elevation、管理员组、integrity 和 UIAccess，再以该用户的非管理员 owner/ACL 规则复查整个路径。只运行固定 `self version --json`，保留隔离环境、3 秒超时、4 KiB 输出上限和子进程回收；仅继承标准 IO 句柄，查询前后继续核对路径、文件身份、SHA256 与执行信任。另一个用户可写的路径、无法取得或验证降权令牌、启动失败仍保持 unknown；不回退为管理员执行该目标。原有管理员可信目标与 Unix 规则不变，不改变业务写入、CLI/JSON、确认标识或持久化契约。
 - Mihari 应用通道 `main`/`dev` 与 mihomo Core 通道 `stable`/`alpha` 分开：应用通道写在 Unix B/P 的 `mihari-channel` sidecar（Windows 为旧数据根），不进 `mihari.yaml` / `/v1`；AIO `--channel` 只写该 sidecar；CLI/TUI 自更新仍走 GitHub Releases。
 - System 页面的 `Core Channel` 行可在 `stable` / `alpha` 之间切换;切换后由守护进程按新通道重装核心。版本行显示 `ParseVersion(mihomo -v)` 的身份 token,从不显示 `Prerelease-Alpha`。
 - 规则顺序从不排序;onboarding、系统、provider、订阅、面板和浏览器变更都经由守护进程变更协调器,破坏性或大范围操作需要确认。
 
+## 运行模式与 GLOBAL
+
+- Mihari 管理 `rule` / `global` / `direct` 的持久意图，settings 可选 `routing` 字段缺省为 Rule，覆盖订阅和 overrides 的 mode。GLOBAL 出口按稳定订阅 ID 保存，无订阅使用独立的 `bootstrap-global`。
+- 可选能力 `routing-mode-v1` 提供 `GET/PATCH /v1/routing`，明确区分 saved/live 与 applied/pending/unknown。`GET /v1/proxies` 附带候选所属的 revision/subscription_id；选择请求可携带 `if_revision`。TUI/CLI 不写业务文件。
+- 在线模式切换经统一 Manager mutation：观察旧模式/出口，按需 PATCH/PUT，读回确认，原子保存 settings 后发布 revision。写失败或保存失败恢复旧 live 状态；无法确认恢复则进入 degraded 并拒绝后续业务写入。请求超时后使用有界恢复 context 核对，不推断已停止或已成功。
+- 普通模式切换不 reload，不关闭连接。runtime YAML 在正常配置生成时写入保存的模式；supervisor 的健康检查在报告 running 前恢复 settings 意图，覆盖已有 runtime 文件及自动重启。订阅 reload 在同一 mutation 内恢复新订阅出口，失败同时回滚配置、目录和旧 live 出口。
+- GLOBAL 只使用实际可选择的候选。丢失出口时优先 DIRECT，否则退回 Rule，持久化后不会自动返回旧节点。Rule/Direct 下也可预选出口；删除订阅同步删除保存选择。
+- Proxies 顶部 Mode 使用项目 Theme 的回车弹窗，GLOBAL 入口复用现有组。候选 revision、订阅身份和会话 epoch 防止迟到结果影响当前选择。
+
 ## Web 网关
 
 - 守护进程在 `web-addr`(默认 `127.0.0.1:9191`)上启动回环 Web 网关。
-- 浏览器认证使用存储在数据根目录下的专用 Web 访问凭据;它绝不是 mihomo 控制器密钥,也不会出现在状态 DTO、默认 CLI 输出或日志中。
+- 浏览器认证使用存储在数据根目录下的专用 Web 访问凭据；它绝不是 mihomo 控制器密钥，也不会出现在状态 DTO 或默认 CLI 输出中。错误自带的凭据可能保留在未脱敏文件日志内。
 - `panel open` 铸造一次性本地 URL、启动 OS 浏览器,且不打印令牌。
 - 面板静态资产位于 `web/{panel}/{build}/` 下,使用原子 `active.json` 切换,并保留一个先前构建用于回滚。
 - 浏览器 REST 与 WebSocket 流量在网关处认证;网关只将控制器密钥注入被代理的控制器请求。
 - 未知写入默认拒绝;核心升级与托管字段写入永远不会到达 mihomo。
+- zashboard/MetaCubeXD 的单字段 `PATCH /configs {"mode":"..."}` 与 `PUT /proxies/GLOBAL` 进入同一持久化用例。mode 与 TUN/其他字段混合、任意完整配置 PUT 仍拒绝；面板自行发起的连接关闭是独立操作。
 
 ## 订阅
 
-- 订阅 URL 仅存储在守护进程私有的目录中,并从 list/show 响应与常规错误中省略。
+- 订阅 URL 与缓存源 `cache-url` 由 daemon 持久化，list/show、事件与公开错误均省略。认证的本地 `GET /v1/subscriptions/{id}/url` 专门返回 schema 与当前 URL；所有已通过现有控制认证的本机用户都可读取，包括 Unix 共享控制凭据允许的本机用户。Web gateway 不挂载此接口；不新增能力标记，TUI/daemon 配套升级。
+- reveal 响应不主动写日志，TUI 传输错误使用安全文案；文件诊断日志沿用当前 dev 原始错误策略，不恢复 redactor。
+- `cache-url` 记录缓存来源，`schedule-from` 记录 URL/interval 变化的调度起点，`interval-refresh-required` 独立持久化强制过期。公共 DTO 添加 `cache_outdated`、`schedule_from`、`interval_refresh_required`。URL 修改保留缓存与 active；interval 修改统一强制过期；成功刷新清除调度起点和过期标记，失败或回滚保留。旧源在途成功/失败均受 profile version 守卫。
+- 调度以 schedule-from（否则 UpdatedAt）加有效 interval 为基准，保留 jitter/backoff；URL/interval 实际变化使旧重试等待失效，执行排队任务前再检查到期。Name/Mode 等无关变化不重置调度。
+- TUI Enter 合并详情与编辑，字段 diff PATCH 走统一 mutation path；PATCH 纳入既有 operation-status 跟踪，finished 仅表示 handler 已结束。冲突与未知结果的重提分别要求确认，新操作 ID 与最新 revision 防止静默覆盖。URL 草稿仅存在于当前弹层。
+- 旧二进制严格解码不能读取新增持久化字段；不支持直接降级。升级前停机备份完整业务数据，降级恢复与旧二进制兼容的一致备份，详见 README。
 - 每个有效配置都有独立缓存,因此 `sub use` 在无 provider 网络访问时也能工作。
 - 每个订阅可独立配置拉取代理(`direct` / `proxy` / `auto`);`auto` 在代理失败时回退直连。
 - 生成的配置总是在 `mihomo -t` 与重载之前恢复 Mihari 托管的内环回控制器、密钥与端口不变量。

@@ -25,6 +25,34 @@ func TestRuntimeClientFiniteEndpoints(t *testing.T) {
 		response string
 		invoke   func(context.Context, *Client) error
 	}{
+		{"routing", http.MethodGet, "/v1/routing", "", `{"schema":"mihari/v1","desired_mode":"rule","state":"pending","revision":1}`,
+			func(ctx context.Context, client *Client) error {
+				result, err := client.Routing(ctx)
+				if err == nil && result.DesiredMode != "rule" {
+					return errors.New("invalid routing state")
+				}
+				return err
+			}},
+		{"routing update", http.MethodPatch, "/v1/routing", `{"operation_id":"op","if_revision":1,"mode":"global"}`, `{"schema":"mihari/v1","desired_mode":"global","live_mode":"global","state":"applied","revision":2}`,
+			func(ctx context.Context, client *Client) error {
+				revision := uint64(1)
+				_, err := client.UpdateRouting(ctx, protocol.RoutingUpdateRequest{OperationID: "op", IfRevision: &revision, Mode: "global"})
+				return err
+			}},
+		{"GLOBAL select revision", http.MethodPut, "/v1/proxy-groups/GLOBAL", `{"operation_id":"op","if_revision":1,"name":"DIRECT"}`, `{"schema":"mihari/v1","operation_id":"op"}`,
+			func(ctx context.Context, client *Client) error {
+				revision := uint64(1)
+				_, err := client.SelectProxy(ctx, "GLOBAL", protocol.ProxySelectionRequest{OperationID: "op", IfRevision: &revision, Name: "DIRECT"})
+				return err
+			}},
+		{"operation status escaped", http.MethodGet, "/v1/operations/setup%2Fone", "", `{"schema":"mihari/v1","operation_id":"setup/one","state":"unknown"}`,
+			func(ctx context.Context, client *Client) error {
+				result, err := client.OperationStatus(ctx, "setup/one")
+				if err == nil && result.State != "unknown" {
+					return errors.New("invalid operation state")
+				}
+				return err
+			}},
 		{"core", http.MethodGet, "/v1/core", "", `{"schema":"mihari/v1","revision":1,"status":"running","version":"v1"}`,
 			func(ctx context.Context, client *Client) error { _, err := client.Core(ctx); return err }},
 		{"install", http.MethodPost, "/v1/core/install", `{"operation_id":"op","if_revision":1}`, `{"schema":"mihari/v1","version":"v1","updated":true,"revision":2}`,

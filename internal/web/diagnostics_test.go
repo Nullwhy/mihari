@@ -71,9 +71,9 @@ func assertWebDiagnostics(t *testing.T, out *webDiagnosticBuffer, event, level s
 			t.Fatal("server invented operation ID")
 		}
 	}
-	for _, secret := range []string{task5ControllerSecret, task5WebCredential, "private-body", "private-query", "private-address", "upstream-private-diagnostic-task5"} {
-		if strings.Contains(text, secret) {
-			t.Fatal("diagnostic leaked sensitive value")
+	for _, record := range records {
+		if cause, ok := record["cause"].(string); !ok || cause == "" {
+			t.Fatal("diagnostic is missing a failure reason")
 		}
 	}
 }
@@ -86,19 +86,19 @@ func TestGatewayMutationDiagnostics_RejectionsAndFallback(t *testing.T) {
 		status                   int
 		event, level             string
 	}{
-		{"parse", "PUT", "/proxies/group", `private-body`, nil, false, 400, "mutation.rejected", "DEBUG"},
-		{"empty name", "PUT", "/proxies/group", `{"name":""}`, nil, false, 400, "mutation.rejected", "DEBUG"},
-		{"config parse", "PATCH", "/configs", `private-body`, nil, false, 400, "mutation.rejected", "DEBUG"},
-		{"empty patch", "PATCH", "/configs", `{}`, nil, false, 403, "mutation.rejected", "DEBUG"},
-		{"managed", "PATCH", "/configs", `{"secret":"private-body"}`, nil, false, 403, "mutation.rejected", "DEBUG"},
-		{"unknown key", "PATCH", "/configs", `{"private-body":true}`, nil, false, 403, "mutation.rejected", "DEBUG"},
-		{"tun shape", "PATCH", "/configs", `{"tun":"private-body"}`, nil, false, 400, "mutation.rejected", "DEBUG"},
-		{"tun enable", "PATCH", "/configs", `{"tun":{"enable":"private-body"}}`, nil, false, 400, "mutation.rejected", "DEBUG"},
-		{"tun stack", "PATCH", "/configs", `{"tun":{"enable":true,"stack":42}}`, nil, false, 400, "mutation.rejected", "DEBUG"},
-		{"unknown route", "POST", "/configs/private-body", `{}`, nil, false, 403, "mutation.rejected", "DEBUG"},
-		{"unsupported", "PATCH", "/configs", `{"tun":{"enable":true}}`, nil, true, 403, "mutation.rejected", "DEBUG"},
-		{"unwired action", "POST", "/restart", `{}`, nil, false, 403, "mutation.rejected", "DEBUG"},
-		{"api", "PATCH", "/configs", `{"tun":{"enable":true}}`, protocol.APIError{Code: protocol.CodeInvalidArgument, Message: "safe public message"}, false, 400, "mutation.failed", "DEBUG"},
+		{"parse", "PUT", "/proxies/group", `private-body`, nil, false, 400, "mutation.rejected", "INFO"},
+		{"empty name", "PUT", "/proxies/group", `{"name":""}`, nil, false, 400, "mutation.rejected", "INFO"},
+		{"config parse", "PATCH", "/configs", `private-body`, nil, false, 400, "mutation.rejected", "INFO"},
+		{"empty patch", "PATCH", "/configs", `{}`, nil, false, 403, "mutation.rejected", "INFO"},
+		{"managed", "PATCH", "/configs", `{"secret":"private-body"}`, nil, false, 403, "mutation.rejected", "INFO"},
+		{"unknown key", "PATCH", "/configs", `{"private-body":true}`, nil, false, 403, "mutation.rejected", "INFO"},
+		{"tun shape", "PATCH", "/configs", `{"tun":"private-body"}`, nil, false, 400, "mutation.rejected", "INFO"},
+		{"tun enable", "PATCH", "/configs", `{"tun":{"enable":"private-body"}}`, nil, false, 400, "mutation.rejected", "INFO"},
+		{"tun stack", "PATCH", "/configs", `{"tun":{"enable":true,"stack":42}}`, nil, false, 400, "mutation.rejected", "INFO"},
+		{"unknown route", "POST", "/configs/private-body", `{}`, nil, false, 403, "mutation.rejected", "INFO"},
+		{"unsupported", "PATCH", "/configs", `{"tun":{"enable":true}}`, nil, true, 403, "mutation.rejected", "INFO"},
+		{"unwired action", "POST", "/restart", `{}`, nil, false, 403, "mutation.rejected", "INFO"},
+		{"api", "PATCH", "/configs", `{"tun":{"enable":true}}`, protocol.APIError{Code: protocol.CodeInvalidArgument, Message: "safe public message"}, false, 400, "mutation.failed", "INFO"},
 		{"select failure", "PUT", "/proxies/group", `{"name":"private-body"}`, os.ErrPermission, false, 502, "mutation.failed", "ERROR"},
 		{"close failure", "DELETE", "/connections/private-body", ``, os.ErrPermission, false, 502, "mutation.failed", "ERROR"},
 		{"close all failure", "DELETE", "/connections", ``, os.ErrPermission, false, 502, "mutation.failed", "ERROR"},
@@ -156,12 +156,12 @@ func TestControllerProxyDiagnostics_SafeFailureAndOriginalContext(t *testing.T) 
 		t.Fatal("proxy failure response changed")
 	}
 	assertWebDiagnostics(t, out, "proxy.failed", "ERROR", 1)
-	if !strings.Contains(out.text(), "permission denied") {
+	if !strings.Contains(out.text(), "read /private-body: permission denied") || !strings.Contains(out.text(), "http://private-address/path?token=private-query") {
 		t.Fatal("typed cause lost")
 	}
 }
 
-func TestGatewayDiagnostics_NormalCancellationIsQuiet(t *testing.T) {
+func TestGatewayDiagnostics_NormalCancellationIsInfo(t *testing.T) {
 	reporter, out := newWebDiagnostics()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -174,7 +174,7 @@ func TestGatewayDiagnostics_NormalCancellationIsQuiet(t *testing.T) {
 	if rec.Code != 502 {
 		t.Fatal("cancellation response changed")
 	}
-	assertWebDiagnostics(t, out, "", "", 0)
+	assertWebDiagnostics(t, out, "proxy.failed", "INFO", 1)
 }
 
 func TestGatewayWebSocketAcceptFailureDiagnostic(t *testing.T) {
@@ -401,5 +401,33 @@ func TestWebSocketRelayFailure_PreservesIndependentFaults(t *testing.T) {
 				t.Fatalf("selected error=%v, want cause %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestWebSocketRelayFailure_IndependentFaultOutranksCancellation(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		if canceled {
+			cancel()
+		}
+		for _, fault := range []error{
+			os.ErrPermission,
+			websocket.CloseError{Code: websocket.StatusPolicyViolation},
+			errors.Join(context.Canceled, os.ErrPermission),
+		} {
+			for _, cancellation := range []error{context.Canceled, context.DeadlineExceeded} {
+				for _, faultFirst := range []bool{false, true} {
+					first := webSocketRelayResult{reading: true, err: fmt.Errorf("read: %w", cancellation), stopped: canceled}
+					second := webSocketRelayResult{reading: true, err: fault, stopped: true}
+					if faultFirst {
+						first, second = second, first
+					}
+					if got := webSocketRelayFailure(ctx, first, second); !errors.Is(got, fault) {
+						t.Errorf("canceled=%v faultFirst=%v: selected %v, want %v", canceled, faultFirst, got, fault)
+					}
+				}
+			}
+		}
+		cancel()
 	}
 }

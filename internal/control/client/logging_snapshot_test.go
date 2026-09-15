@@ -72,6 +72,30 @@ func TestOpenMachineSnapshot_RejectsMutatedFixtureWithoutPublishing(t *testing.T
 	}
 }
 
+type snapshotCloseFailureBody struct {
+	io.Reader
+	err error
+}
+
+func (b snapshotCloseFailureBody) Close() error { return b.err }
+
+func TestOpenMachineSnapshot_PreservesHeaderDecodeAndCloseCauses(t *testing.T) {
+	closeCause := errors.New("close snapshot response fixture")
+	client := NewHTTP("http://mihari", "token", &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: snapshotCloseFailureBody{Reader: strings.NewReader(`{"schema":` + "\n"), err: closeCause}}, nil
+	})})
+	_, err := client.OpenMachineSnapshot(context.Background(), fixtureWindow())
+	var syntax *json.SyntaxError
+	var api protocol.APIError
+	parseCause := errors.As(err, &syntax) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+	if !parseCause || !errors.Is(err, closeCause) {
+		t.Fatalf("decode/close cause lost: %v", err)
+	}
+	if !errors.As(err, &api) || api.Code != protocol.CodeDataFailure || err.Error() != "machine snapshot failed" {
+		t.Fatalf("public error changed: %v", err)
+	}
+}
+
 func TestOpenMachineSnapshot_FixturePublishesManifestV2(t *testing.T) {
 	fixture := machineSnapshotFixture(t)
 	srv := httptest.NewServer(snapshotBodyHandler(t, fixture, false, nil))
@@ -197,34 +221,58 @@ func TestOpenMachineSnapshot_CancelClosesBody(t *testing.T) {
 }
 
 func TestOpenMachineSnapshot_DoesNotReuseClientHTTPTimeout(t *testing.T) {
-	prevIdle, prevTotal := snapshotIdleTimeout, snapshotTotalTimeout
-	snapshotIdleTimeout = time.Second
-	snapshotTotalTimeout = time.Second
-	t.Cleanup(func() {
-		snapshotIdleTimeout = prevIdle
-		snapshotTotalTimeout = prevTotal
-	})
+	fixture := machineSnapshotFixture(t)
 	started := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
-		time.Sleep(200 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(machineSnapshotFixture(t))
+		_, _ = w.Write(fixture)
 	}))
 	t.Cleanup(srv.Close)
 	c := snapshotTestClient(srv)
 	c.http.Timeout = 50 * time.Millisecond
+	if got := c.snapshotHTTP().Timeout; got != 0 {
+		t.Fatalf("snapshot client inherited ordinary HTTP timeout: %v", got)
+	}
 	req, _, out := newAssembleRequest(t)
 	result, err := assembleMachineSnapshot(t, c, fixtureWindow(), req)
 	if err != nil {
-		t.Fatalf("independent stream client reused the 10s/50ms HTTP timeout: %v", err)
+		t.Fatalf("assemble snapshot with independent HTTP client: %v", err)
 	}
 	assertSnapshotExportIdentity(t, result.Path, out)
 	select {
 	case <-started:
 	default:
 		t.Fatal("handler was not reached")
+	}
+}
+
+func TestSnapshotHTTP_DoesNotMutateBaseClient(t *testing.T) {
+	transport := &http.Transport{ResponseHeaderTimeout: 50 * time.Millisecond}
+	t.Cleanup(transport.CloseIdleConnections)
+	redirected := false
+	base := &http.Client{Timeout: 50 * time.Millisecond, Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			redirected = true
+			return http.ErrUseLastResponse
+		},
+	}
+	c := NewHTTP("http://mihari", "token", base)
+	snapshot := c.snapshotHTTP()
+	t.Cleanup(snapshot.CloseIdleConnections)
+	if snapshot == base || snapshot.Timeout != 0 || base.Timeout != 50*time.Millisecond {
+		t.Fatal("snapshot timeout is not independent of the ordinary client")
+	}
+	cloned, ok := snapshot.Transport.(*http.Transport)
+	if !ok || cloned == transport || cloned.ResponseHeaderTimeout != snapshotIdleTimeout {
+		t.Fatal("snapshot transport did not receive an independent header budget")
+	}
+	if transport.ResponseHeaderTimeout != 50*time.Millisecond {
+		t.Fatal("snapshot changed the ordinary transport's header budget")
+	}
+	if err := snapshot.CheckRedirect(nil, nil); err != http.ErrUseLastResponse || !redirected {
+		t.Fatal("snapshot discarded the redirect policy")
 	}
 }
 
@@ -252,7 +300,7 @@ func TestOpenMachineSnapshot_IdleTimeoutDoesNotPublish(t *testing.T) {
 	assertNoExportResidue(t, parent, out)
 }
 
-func TestOpenMachineSnapshot_SecondRedactORsServerFlag(t *testing.T) {
+func TestOpenMachineSnapshot_PreservesContentAndHistoricalServerFlag(t *testing.T) {
 	payload := []byte(`{"time":"2026-09-05T00:00:00Z","msg":"local-secret-value"}`)
 	encoded := base64.StdEncoding.EncodeToString(payload)
 	sum := snapshotPayloadDigest(payload)
@@ -275,8 +323,8 @@ func TestOpenMachineSnapshot_SecondRedactORsServerFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := readExportZip(t, out)
-	if strings.Contains(got["daemon/mihari-daemon.log"], "local-secret-value") {
-		t.Fatal("local secret leaked")
+	if !strings.Contains(got["daemon/mihari-daemon.log"], "local-secret-value") {
+		t.Fatal("client replaced original snapshot content")
 	}
 	manifest := decodeManifest(t, got["manifest.json"])
 	files, _ := manifest["files"].([]any)

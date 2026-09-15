@@ -80,13 +80,15 @@ TUI 的 System 页面提供 Logging 区，可修改由守护进程持有的级�
 
 日志导出只在 TUI 中提供：Logs 页按 `e`，或在 System → Logging 选择 **Export logs**。可选最近 24 小时、最近 60 分钟、本地时间区间或全部记录。Unix 默认目录是本用户的 `U/logs-export/`（Windows/私有 P 保留原目录）；自定义目标必须是既有目录内的绝对 `.zip` 路径。导出永不覆盖已有文件，默认重名时自动编号。
 
-Unix 系统导出使用 mihari-logs-export/v2，组合认证机器快照与本用户日志，离线必须明确选择仅本用户日志；Windows/显式私有 P 保持本地 v1。zip 固定使用 `manifest.json`、`daemon/mihari-daemon.log`、`tui/mihari-tui.log`、`mihomo/mihomo.log` 这些 entry，某来源无匹配记录时省略对应日志 entry。每条记录会递归二次脱敏并重新编码。自动遮蔽不保证移除节点名、目标域名/IP 或流量元数据，发送前必须自查这些内容。
+Unix 系统导出使用 mihari-logs-export/v2，组合认证机器快照与本用户日志，离线必须明确选择仅本用户日志；Windows/显式私有 P 保持本地 v1。zip 固定使用 `manifest.json`、`daemon/mihari-daemon.log`、`tui/mihari-tui.log`、`mihomo/mihomo.log` 这些 entry，某来源无匹配记录时省略对应日志 entry。文件日志、快照与导出均不脱敏，错误自带的密码、访问令牌、完整 URL、配置片段及路径会保留；导出开始前及完成后都有红色说明，分享前应自行检查。
 
 Unix 自定义目标的同 UID 进程和本机 root/管理员属于受信主体。不可信共享父目录下，若内容已清理，仍可能留下空的 0700 私有 workspace；若清理 IO 失败，界面会报告可能存在内容残留。导出持有目标父目录 identity，生成期间替换父路径会安全失败而不会跟随；发布后外部再次改名目标目录，可能使已显示路径失效。
 
 旧版二进制以 `KnownFields(true)` 严格解码 `mihari.yaml`，不能读取非默认的 `log:` 块。降级前应在 System → Logging 恢复 `info` / 10 MiB / 3 份文件，使该块自动移除；也可以先备份设置文件后手动删除 `log:`。
 
-日志脱敏是尽力而为，所有日志与导出包仍须按敏感资料处理。
+诊断文本、HTTP 失败正文和 mihomo 单个逻辑输出行各限 256 KiB，超出明确标记截断。最坏 JSON 转义可能使一条逻辑诊断分成多条 JSONL；通过 `record_id`、`fragment_index`、`fragment_count` 关联和重组，缺片可识别。历史脱敏日志无法恢复原文，旧客户端仍可能按旧策略处理导出。
+
+普通 CLI 不创建或探测日志文件；当前执行路径已有可用文件 logger/reporter 时记录，否则跳过。预期拒绝和主动取消为 INFO、重试和可恢复警告为 WARN、最终未恢复失败为 ERROR，均遵循用户配置的级别。用户提示与日志原文独立。
 
 ## 核心与代理管理
 
@@ -98,6 +100,11 @@ mihari core install
 mihari core update
 mihari core restart
 mihari proxy groups
+mihari proxy mode
+mihari proxy mode rule
+mihari proxy mode global
+mihari proxy mode direct
+mihari proxy select GLOBAL PROXY
 mihari proxy select GROUP PROXY
 mihari proxy test GROUP
 mihari connections list
@@ -107,6 +114,12 @@ mihari rules list
 mihari traffic --follow
 mihari logs --follow
 ```
+
+`proxy mode` 查询保存模式、实际模式和应用状态，带参数则切换；支持 `--json`。模式只有 `rule` / `global` / `direct`，默认 Rule，覆盖订阅自带 mode。模式由 Mihari 全局持久化，GLOBAL 出口按订阅记忆；Rule/Direct 下也能预选 GLOBAL，选择本身不会切换模式。Global 选择 `DIRECT` 表示所有新连接通过 GLOBAL 直连；Direct 是独立运行模式，不依赖 GLOBAL 的选择。
+
+TUI Proxies 顶部选中 **Mode** 按 Enter 打开弹窗，↑/↓ 选择、Enter 应用、Esc 取消。下一行 **GLOBAL** 展开同页的 GLOBAL 组，候选完全来自 mihomo。切换保留已有连接。有效候选消失时，有 DIRECT 则持久保存 DIRECT，否则保存 Rule，不会在节点重新出现时自动切回。内核明确停止时可保存模式，显示 `pending`；无法确认实际状态时显示 `unknown`，不会把保存值伪装成运行值。
+
+settings 新增可选 `routing.mode`、`routing.global-selections`（订阅 ID → 出口）与 `routing.bootstrap-global`。它们由 daemon 管理；支持的 Web 面板也走相同保存路径。旧版本可能拒绝新增 settings 字段，降级前应备份并迁移设置。旧 daemon 不通告 `routing-mode-v1` 时，TUI 隐藏新入口。
 
 ## 订阅管理
 
@@ -126,7 +139,9 @@ mihari sub set ID --proxy auto
 mihari sub remove ID --yes
 ```
 
-订阅 URL 仅存储在守护进程私有的目录中,并从 list/show 响应与常规错误中省略。每个有效配置都有独立缓存,因此 `sub use` 在无 provider 网络访问时也能工作。`--proxy` 为该订阅的拉取代理:`direct`(默认)、`proxy` 或 `auto`;`auto` 在代理失败时回退直连。生成的配置总是在 `mihomo -t` 与重载之前恢复 Mihari 托管的内环回控制器、密钥与端口不变量。
+订阅 URL 由守护进程持久化,并从 list/show 响应与常规错误中省略。每个有效配置都有独立缓存,因此 `sub use` 在无 provider 网络访问时也能工作。`--proxy` 为该订阅的拉取代理:`direct`(默认)、`proxy` 或 `auto`;`auto` 在代理失败时回退直连。生成的配置总是在 `mihomo -t` 与重载之前恢复 Mihari 托管的内环回控制器、密钥与端口不变量。
+
+`sub set` 修改 URL 保留旧缓存与 InUse，不立即拉取或重载；修改单条 interval 重置调度并标记 Expired，成功刷新后清除。CLI 参数仍为 `--proxy`，JSON 字段仍为 `proxy_mode`；仅新增公开缓存状态字段，没有新增 reveal CLI 命令。普通 list/show 响应和公开错误继续省略完整 URL；专门的认证本地 API 是支持的读取入口，但文件日志和导出仍可能因原始错误保留 URL。TUI 操作、结果未知处理和配套升级/降级备份要求见 [README](../README.zh-CN.md)。
 
 ## 系统代理与 TUN
 

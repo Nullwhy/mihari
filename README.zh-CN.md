@@ -40,10 +40,20 @@ Mihari 是面向 Windows、Linux 和 macOS 的跨平台 [mihomo](https://github.
 - **Web 面板**:一键安装 / 更新 / 激活 / 回滚 zashboard 与 MetaCubeXD,置于带独立访问凭据的回环 Web 网关之后。
 - **系统代理与 TUN**:跨平台的系统代理控制与托管 TUN,均由守护进程持有并持久化。若其他产品已持有系统代理(`system_proxy_conflict`),或检测到其他 TUN / mihomo 实例(`tun_conflict`),enable 会失败,除非传入 `--force`(TUI 会要求确认)。
 - **端口配置**:System 页面可修改 Mixed / Controller / Web 端口;占用显示 `Owned` 或 `Occupied by name (pid)`。应用后通常需要重启守护进程。
-- **TUI 内更新 Mihari**：System 页面进入时检查 GitHub Releases，显示 `当前版本 · 最新版本 available` 或 `当前版本 · Up to date`；以管理员/root 权限启动时可替换二进制、同步并重启已安装的系统服务副本、验证 daemon 版本，并自动进入更新后的 TUI。
+- **TUI 内更新 Mihari**：System 页面进入时检查 GitHub Releases，显示 `当前版本 · 最新版本 available` 或 `当前版本 · Up to date`；以管理员/root 权限启动时可替换二进制、同步并重启已安装的系统服务副本、验证 daemon 版本，并自动进入更新后的 TUI。更新确认会将安全的非标准已安装构建标识显示为 `Unknown[标识]`，兼容性仍为未知；长内容可用 ↑/↓ 或 PgUp/PgDn 滚动，默认选择 Cancel。
 - **内核通道**:System 页面可在 mihomo 的 `stable` / `alpha` 通道之间切换。
 
+Windows 更新可使用同一用户的非管理员令牌查询用户目录中的安装版本，包括默认的 AppData 安装位置。目录权限不安全或无法取得降权 UAC 令牌时，版本仍显示 unknown；版本查询不会以管理员权限执行用户可写的文件。
+
 单个无 CGO 的静态二进制(< 15 MB)即包含全部功能,内置 GitHub Releases 自动更新与本地 GeoIP 解析。
+
+代理节点测速会读取 provider 节点，并在需要时调用 mihomo 的 provider 专用接口。同名节点在每个组内合并显示、共享测速结果：优先全局普通节点，否则按 provider 名排序选择首个匹配项。TUI 启动后的首次成功检查会对重名弹窗提示，测速来源可能与组实际选中的来源不同。provider 读取对瞬时故障最多尝试三次；持续失败时保留旧列表，显示 **Stale data** 和关键原因，恢复后自动清除提示。CLI/TUI 与 daemon 应配套升级。
+
+TUI 节点测速进行中时，卡片在协议名称旁仅显示盲文加载动画。
+
+TUI 订阅表格的 Name 和 Traffic 列按内容分配宽度，分别最多占 32 和 24 个终端字符格；多余空间留在右侧，窄屏优先隐藏次要字段。
+
+mihomo HTTP 失败的原始报错与上游状态会写入诊断日志，范围包括 gateway 和 WebSocket 握手。文件日志及导出不脱敏，保留错误自带的凭据、URL、路径与配置片段以便排查；用户侧仍显示简洁关键原因。
 
 ## 快速开始
 
@@ -112,7 +122,11 @@ curl -fsSL https://cloud.xn--30q18ry71c.com/p/public/mihari-release/mihari/insta
 mihari
 ```
 
-交互式设置会安装 mihomo 核心、引导添加首个订阅并准备本地 GeoIP 数据。它会在首页预检托管端口(冲突时一键切换到可用端口),复用已有的本地 core/GeoIP,并在最后的审查页汇总端口、core、订阅、GeoIP 与服务注册状态。
+交互式设置沿用现有 TUI 主题和分步布局，长任务显示当前动作、动态等待指示与耗时。失败时显示安全的具体原因和下一步建议，按 F2 可打开可滚动、可复制的诊断详情。
+
+端口修改经确认后立即由 daemon 保存，已保存资源不会因中断丢失。重新进入时检查必需的端口与核心，继续未完成的设置；可选订阅、GeoIP 缺失不会强制进入向导。Core 分别展示本地可用性、版本、通道和运行状态，GeoIP 分别展示 Country/ASN 可用性及更新时间。已有订阅时保留概览步骤，展示数量、各项状态及当前使用项，按 Enter 继续且不修改已有订阅；继续添加或管理请进入 Subscriptions 页面。新订阅已注册但首次下载失败时，重试会刷新同一订阅，不重复添加。
+
+操作中按 Esc 会先确认取消，再核对 daemon 执行是否收尾及实际保存结果。“结果待确认”不代表没有保存，此时可重新检查或退出，不盲目重复提交。Ctrl+Q 确认退出。已确认的启动端口冲突会通过认证本地 IPC 开放受限端口恢复，其他业务变更仍不可用。改端口后需重启 daemon，再重新检查或等待重连；当前服务接口不能验证服务是否属于所连接的实例，因此向导不会自动重启可能不相干的服务。
 
 **添加订阅并启用系统代理**
 
@@ -130,6 +144,7 @@ mihari sysproxy enable
 | 查看状态 | `mihari status` |
 | 核心管理 | `mihari core status` · `mihari core restart` |
 | 代理组 | `mihari proxy groups` · `mihari proxy select <GROUP> <PROXY>` |
+| 运行模式 | `mihari proxy mode [rule\|global\|direct]` · `mihari proxy select GLOBAL <PROXY>` |
 | 订阅管理 | `mihari sub add <NAME> <URL>` · `mihari sub set <ID> --proxy auto` · `mihari sub use <ID>` |
 | 系统代理 / TUN | `mihari sysproxy enable` · `mihari sysproxy enable --force` · `mihari tun enable` · `mihari tun enable --force` |
 | Web 面板 | `mihari panel list` · `mihari panel open` |
@@ -138,6 +153,22 @@ mihari sysproxy enable
 | 更新 mihari | System 页 `Update Mihari` · `mihari self update` |
 
 完整命令参考见 [docs/commands.md](docs/commands.md),架构与安全机制见 [docs/architecture.md](docs/architecture.md)。
+
+TUI **Proxies** 页顶部的 **Routing** 卡片包含 **Mode** 和 **GLOBAL**。**Mode** 按 Enter 打开 Rule / Global / Direct 选择弹窗，↑/↓ 选择、Enter 应用、Esc 取消；**GLOBAL** 入口展开 mihomo 返回的候选组，并自动滚动到整个 section 完整可见；超过一屏时从列表视口顶部展示，继续用方向键浏览候选。Mihari 全局保存模式、按订阅保存 GLOBAL 出口，支持面板发起的相同操作。默认使用 Rule，切换模式和出口保留已有连接。保存的出口消失时，有 DIRECT 候选则保存 DIRECT，否则保存 Rule；内核停止时保存的模式显示为 pending，待启动应用。
+
+Routing 标签为白色、值为绿色。仅焦点行在值后紧跟显示 `· Press Enter to Change` 或 `· Press Enter to Select`；窄屏优先保留值，空间不足时隐藏操作提示。状态说明不随失焦隐藏。
+
+已选代理卡片使用蓝色 **●** 标记，颜色与日志 **INFO** 一致。Proxies 每个组（含 GLOBAL）的当前选择右侧都有 **→ Jump to Selected**（窄窗口缩短为 **→ Selected**）。在组标题上按 → 聚焦按钮，再按 Enter 自动展开并定位到当前选中的卡片；← 返回组标题。定位只移动键盘焦点，后续刷新改变选中项时不自动跟随。保留的 **Last selected** 数据仍可定位；选中项为空或不在候选列表中时按钮置灰。
+
+TUI **Subs** 页按 Enter 打开可编辑详情，`a` 添加订阅。Tab/Shift+Tab 或 ↑/↓ 切换字段，←/→/Space 在 **Auto refresh** 和 **Mode** 行循环选择；文本框 Enter 进入下一项，仅 **Save** 焦点上的 Enter 提交。PgUp/PgDn 滚动正文，长 URL 单行横向滚动。所有 TUI 内置文案均为英文。列表显示 **InUse**、**Enabled**、**Status**、**Mode**，`p` 循环切换拉取模式。
+
+添加和编辑共用居中紧凑表单，详情按运行状态和设置分组；没有错误时隐藏错误行，时间显示为本地时间并精确到分钟。窗口较矮时正文滚动，**Save** 始终可见。循环字段使用反色焦点，文本框使用浅色输入底和白色光标。快捷键仅在终端底部显示一份并随焦点变化。**Interval** 留空时以占位文字显示当前全局间隔，保存空值仍表示继承。
+
+修改 URL 会保留旧缓存和 InUse，不立即下载或 reload；**Outdated** 表示缓存来自旧 URL，仍可离线 Use。修改单条 interval 会重置下次刷新时间，并持久标记 **Expired**，直到刷新成功（包括有效 304）；Disabled、Failed、Missing、Outdated 等更高优先级状态仍优先显示。关闭 Auto refresh 时 Next 显示 **Manual**。
+
+保存等待结果后关闭。revision 冲突会询问是否仅覆盖本次实际修改的字段。结果未知时先只读查询操作和当前状态，不自动重放保存；**Submit again** 需要再次确认，添加场景可能产生重复条目。关闭界面不代表撤销保存。已经添加但首次下载失败时，返回列表选中该订阅，按 `r` 重试下载。
+
+TUI 与 daemon 必须配套升级，不保证混用版本。升级前停止 daemon，按实际布局备份完整业务数据（Unix B/D，或 Windows/私有 P），将 catalog、缓存、settings/state、运行配置作为一致整体保存。旧二进制无法读取新增 catalog 字段，不支持直接降级；回退二进制时应停机恢复兼容的完整备份，不通过单独删除 YAML 字段降级。
 
 ## 平台目标
 
@@ -177,11 +208,15 @@ Logging 位于 Network 下方、About 上方。Unix 分别显示机器日志目�
 
 Windows 私有日志授权给具体的数据用户及 LocalSystem，兼容提权进程创建、owner 为 Administrators 的数据目录；写入器启动时会修复 daemon、TUI、mihomo 的现有日志、保留归档及锁文件的 ACL，不改动内容。运行中的服务创建或加固文件时会重新读取根目录权限策略，避免轮转后恢复旧权限。如果旧版本已经移除了普通用户访问权限，需要更新后的程序以管理员权限运行一次完成修复。TUI 内的提权更新流程会以该权限进入新 TUI；手动替换二进制的用户可能需要首次以管理员权限启动。
 
-Unix 系统模式使用 `mihari-logs-export/v2`，通过认证的机器快照协议组合机器与本用户日志；离线时须明确选择仅本用户日志。Windows/显式私有 P 保持本地 v1。zip 固定包含 `manifest.json`，以及有内容时才出现的 `daemon/mihari-daemon.log`、`tui/mihari-tui.log`、`mihomo/mihomo.log`。记录会重新解析、筛选、递归二次脱敏并编码，不会原样复制 JSONL。若对象成员的键本身含已识别凭据或 URL，该成员会被省略，安全的兄弟字段仍保留。已知凭据和 URL 会被遮蔽，但节点名、目标域名/IP 与流量元数据仍可能保留；发送前请逐项自查。
+Unix 系统模式使用 `mihari-logs-export/v2`，通过认证的机器快照协议组合机器与本用户日志；离线时须明确选择仅本用户日志。Windows/显式私有 P 保持本地 v1。zip 固定包含 `manifest.json`，以及有内容时才出现的 `daemon/mihari-daemon.log`、`tui/mihari-tui.log`、`mihomo/mihomo.log`。记录经过有效性与时间范围筛选，并保留原始 JSON 记录字节；快照及导出均不脱敏。导出前与成功页面以红色文字说明：日志可能包含密码、访问令牌、完整订阅地址及用户配置，分享前请自行检查。
+
+诊断文本、HTTP 失败正文与 mihomo 单个逻辑输出行各限 256 KiB，超限明确标记。JSON 转义使记录超过既有快照限额时，使用带 `record_id`、`fragment_index`、`fragment_count` 的有界分片；轮转或写入中断造成的缺片仍可识别。保留已有堆栈，普通错误不额外采集堆栈。
+
+错误仅使用当前可用的文件 logger；普通 CLI 不创建日志，也不打开历史日志文件。预期拒绝和主动取消为 INFO，可恢复失败及重试尝试为 WARN，最终失败为 ERROR，并遵循配置的级别过滤。同一失败由实际执行 owner 记录，重放同一结果不重复记错。
 
 导出全程持有已打开的目标父目录 identity，生成期间父路径被替换时不会跟随被替换后的路径。Unix 清理以同 UID 与本机 root/管理员为受信主体；若自定义父目录初始为不可信共享目录，即使导出期间收紧权限，内容清理成功后仍可能留下空的私有 workspace，清理 IO 失败则会报告可能存在内容残留。发布成功后若目标目录又被外部改名，界面显示的绝对路径也可能失效。
 
-旧版二进制使用 `KnownFields(true)` 解码 `mihari.yaml`，无法读取自定义 `log:` 块。降级前，请在 System → Logging 恢复 `info` / 10 MiB / 3 份文件，使该块自动移除；或先备份设置文件，再手动删除 `log:`。脱敏仅为尽力而为，仍应将所有日志文件按敏感资料处理，并在分享前审阅内容。
+旧版二进制使用 `KnownFields(true)` 解码 `mihari.yaml`，无法读取自定义 `log:` 块。降级前，请在 System → Logging 恢复 `info` / 10 MiB / 3 份文件，使该块自动移除；或先备份设置文件，再手动删除 `log:`。历史脱敏日志无法恢复原文，旧客户端仍可能对导出内容执行脱敏。
 
 ## 开发
 

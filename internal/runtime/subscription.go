@@ -51,6 +51,22 @@ func (m *Manager) Subscriptions() subscription.PublicCatalog {
 	return m.subscriptions.Snapshot().Public()
 }
 
+// SubscriptionURL reveals the current source to authenticated local clients.
+func (m *Manager) SubscriptionURL(ctx context.Context, id string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if m.subscriptions == nil {
+		return "", subscriptionsUnavailable()
+	}
+	for _, profile := range m.subscriptions.Snapshot().Profiles {
+		if profile.ID == id {
+			return profile.URL, nil
+		}
+	}
+	return "", protocol.APIError{Code: protocol.CodeInvalidArgument, Message: "subscription not found"}
+}
+
 func (m *Manager) AddSubscription(ctx context.Context, operation Operation, input AddSubscriptionInput) (subscription.PublicProfile, error) {
 	result, err := m.doOperation(ctx, "sub-add:"+operation.ID, func(ctx context.Context) (any, error) {
 		if m.subscriptions == nil {
@@ -113,9 +129,9 @@ func (m *Manager) RefreshSubscription(ctx context.Context, operation Operation, 
 		}
 		candidate, err := m.prepareConfig(ctx, prepared.Document())
 		if err != nil {
-			return nil, err
+			return nil, m.subscriptions.RecordRefreshFailure(prepared, err)
 		}
-		defer candidate.cleanup()
+		defer func() { collectWarning(ctx, "subscription", "candidate.cleanup.failed", candidate.cleanup()) }()
 		if err := m.lockMutation(ctx); err != nil {
 			return nil, err
 		}
@@ -139,7 +155,7 @@ func (m *Manager) RefreshSubscription(ctx context.Context, operation Operation, 
 		})
 		if err != nil {
 			m.markConfigDegraded(ctx, err)
-			return nil, err
+			return nil, m.subscriptions.RecordRefreshFailure(prepared, err)
 		}
 		return findPublicProfile(m.subscriptions.Snapshot().Public(), id)
 	})
@@ -169,7 +185,7 @@ func (m *Manager) UseSubscription(ctx context.Context, operation Operation, id s
 		if err != nil {
 			return nil, err
 		}
-		defer candidate.cleanup()
+		defer func() { collectWarning(ctx, "subscription", "candidate.cleanup.failed", candidate.cleanup()) }()
 		if err := m.lockMutation(ctx); err != nil {
 			return nil, err
 		}
@@ -238,7 +254,7 @@ func (m *Manager) RemoveSubscription(ctx context.Context, operation Operation, i
 					}
 					return snapshot, prepareErr
 				}
-				defer candidate.cleanup()
+				defer func() { collectWarning(ctx, "subscription", "candidate.cleanup.failed", candidate.cleanup()) }()
 				if applyErr := m.commitRuntimeConfig(ctx, candidate); applyErr != nil {
 					if restoreErr := m.subscriptions.Restore(before); restoreErr != nil {
 						return snapshot, degradedConfigError(applyErr, restoreErr)
@@ -246,6 +262,19 @@ func (m *Manager) RemoveSubscription(ctx context.Context, operation Operation, i
 					return snapshot, applyErr
 				}
 				markConfigApplied(&snapshot)
+			} else {
+				_, saveErr := m.updateSettings(ctx, func(settings *config.Settings) error {
+					if settings.Routing != nil {
+						delete(settings.Routing.GlobalSelections, id)
+					}
+					return nil
+				})
+				if saveErr != nil {
+					if restoreErr := m.subscriptions.Restore(before); restoreErr != nil {
+						return snapshot, degradedConfigError(saveErr, restoreErr)
+					}
+					return snapshot, saveErr
+				}
 			}
 			m.syncSubscriptionState(&snapshot, after)
 			return snapshot, nil
@@ -255,7 +284,9 @@ func (m *Manager) RemoveSubscription(ctx context.Context, operation Operation, i
 			m.markConfigDegraded(ctx, err)
 			return nil, err
 		}
-		_ = os.Remove(m.subscriptions.CachePath(id))
+		if cleanupErr := os.Remove(m.subscriptions.CachePath(id)); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
+			collectWarning(ctx, "subscription", "cache.cleanup.failed", cleanupErr)
+		}
 		return struct{}{}, nil
 	})
 	return err
@@ -274,6 +305,14 @@ func (m *Manager) SetSubscriptionEnabled(ctx context.Context, operation Operatio
 
 func (m *Manager) SetSubscription(ctx context.Context, operation Operation, id string, input SetSubscriptionInput) (subscription.PublicProfile, error) {
 	return m.mutateSubscription(ctx, "sub-set:", operation, id, func(catalog *subscription.Catalog, profile *subscription.Profile) error {
+		intervalChanged := input.Interval != nil && *input.Interval != profile.Interval
+		urlChanged := input.URL != nil && *input.URL != profile.URL
+		if intervalChanged || urlChanged {
+			m.subscriptions.ResetRefreshSchedule(profile)
+		}
+		if intervalChanged {
+			profile.IntervalRefreshRequired = true
+		}
 		if input.Name != nil {
 			profile.Name = *input.Name
 		}
@@ -289,15 +328,11 @@ func (m *Manager) SetSubscription(ctx context.Context, operation Operation, id s
 		if input.ProxyMode != nil {
 			profile.ProxyMode = *input.ProxyMode
 		}
-		if input.URL != nil && *input.URL != profile.URL {
+		if urlChanged {
 			profile.URL = *input.URL
-			profile.Generation = 0
-			profile.UpdatedAt = subscription.Profile{}.UpdatedAt
 			profile.ETag = ""
 			profile.LastModified = ""
-			if catalog.ActiveID == profile.ID {
-				catalog.ActiveID = ""
-			}
+			profile.LastError = ""
 		}
 		profile.Version++
 		return nil
@@ -332,7 +367,7 @@ func (m *Manager) mutateSubscription(ctx context.Context, prefix string, operati
 					}
 					return snapshot, prepareErr
 				}
-				defer candidate.cleanup()
+				defer func() { collectWarning(ctx, "subscription", "candidate.cleanup.failed", candidate.cleanup()) }()
 				if applyErr := m.commitRuntimeConfig(ctx, candidate); applyErr != nil {
 					if restoreErr := m.subscriptions.Restore(before); restoreErr != nil {
 						return snapshot, degradedConfigError(applyErr, restoreErr)
@@ -348,6 +383,10 @@ func (m *Manager) mutateSubscription(ctx context.Context, prefix string, operati
 		if err != nil {
 			m.markConfigDegraded(ctx, err)
 			return nil, err
+		}
+		select {
+		case m.subscriptionChanges <- struct{}{}:
+		default:
 		}
 		return findPublicProfile(m.subscriptions.Snapshot().Public(), id)
 	})
@@ -398,9 +437,7 @@ func (m *Manager) prepareConfigWithSettings(ctx context.Context, document subscr
 		return configCandidate{}, err
 	}
 	candidate, err := m.prepareContent(ctx, content)
-	if m.trustedCore != nil {
-		candidate.generation, candidate.generationBound = generation, true
-	}
+	candidate.generation, candidate.generationBound = generation, true
 	return candidate, err
 }
 
@@ -460,7 +497,7 @@ func (m *Manager) prepareContent(ctx context.Context, content []byte) (configCan
 	return configCandidate{path: path, content: content, hash: hash}, nil
 }
 
-func (m *Manager) commitRuntimeConfig(ctx context.Context, candidate configCandidate) error {
+func (m *Manager) commitRuntimeConfigBytes(ctx context.Context, candidate configCandidate) error {
 	if m.trustedCore != nil {
 		return m.commitTrustedRuntimeConfig(ctx, candidate)
 	}
@@ -555,12 +592,15 @@ func degradedConfigError(causes ...error) error {
 	return diagnostics.Wrap(protocol.APIError{Code: protocol.CodeDataFailure, Message: "subscription state rollback failed", Details: map[string]any{"degraded": true}}, errors.Join(causes...))
 }
 
-func (c configCandidate) cleanup() {
+func (c configCandidate) cleanup() error {
 	if c.generated != nil {
-		_ = c.generated.Close()
+		return c.generated.Close()
 	} else if c.path != "" {
-		_ = os.Remove(c.path)
+		if err := os.Remove(c.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
+	return nil
 }
 
 // commitTrustedRuntimeConfig publishes validated bytes and reloads the fixed
@@ -617,3 +657,7 @@ func (m *Manager) commitTrustedRuntimeConfig(ctx context.Context, candidate conf
 	}
 	return diagnostics.Wrap(protocol.APIError{Code: protocol.CodeUpstreamFailure, Message: "mihomo rejected generated configuration; previous configuration restored"}, e)
 }
+
+// SubscriptionChanges supplies coalesced committed-edit notifications to the single subscription scheduler.
+// The Manager owns this channel for its lifetime; it is never closed.
+func (m *Manager) SubscriptionChanges() <-chan struct{} { return m.subscriptionChanges }

@@ -2,6 +2,7 @@ package logging
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,7 @@ import (
 	"github.com/mihari-proxy/mihari/internal/platform"
 )
 
-func TestExport_ZipLayoutManifestAndRedaction(t *testing.T) {
+func TestExport_ZipLayoutManifestAndOriginalContent(t *testing.T) {
 	fs, paths := openExportTestFS(t)
 	writeExportFixture(t, fs, paths.DaemonLog, strings.Join([]string{
 		`{"time":"2026-09-02T10:30:00Z","token":"secret","seq":1}`,
@@ -71,13 +72,13 @@ func TestExport_ZipLayoutManifestAndRedaction(t *testing.T) {
 	if _, ok := got[exportTUIEntry]; ok {
 		t.Fatal("empty TUI source must be omitted")
 	}
-	if strings.Contains(got[exportDaemonEntry], "secret") || !strings.HasSuffix(got[exportDaemonEntry], "\n") {
+	if !strings.Contains(got[exportDaemonEntry], "secret") || !strings.HasSuffix(got[exportDaemonEntry], "\n") {
 		t.Fatalf("daemon=%q", got[exportDaemonEntry])
 	}
-	if got[exportDaemonEntry] != `{"seq":1,"time":"2026-09-02T10:30:00Z","token":"***"}`+"\n" {
+	if got[exportDaemonEntry] != `{"time":"2026-09-02T10:30:00Z","token":"secret","seq":1}`+"\n" {
 		t.Fatalf("daemon JSONL=%q", got[exportDaemonEntry])
 	}
-	if got[exportMihomoEntry] != `{"msg":"ok","time":"2026-09-02T11:00:00Z"}`+"\n" {
+	if got[exportMihomoEntry] != `{"time":"2026-09-02T11:00:00Z","msg":"ok"}`+"\n" {
 		t.Fatalf("mihomo JSONL=%q", got[exportMihomoEntry])
 	}
 	var manifest map[string]any
@@ -90,7 +91,7 @@ func TestExport_ZipLayoutManifestAndRedaction(t *testing.T) {
 		"schema": "mihari-logs-export/v1", "exported_at": "2026-09-02T23:41:08+08:00", "timezone": "+08:00",
 		"range": map[string]any{"kind": "between", "from": "2026-09-02T10:00:00Z", "to": "2026-09-02T12:00:00Z"},
 		"files": []any{
-			map[string]any{"name": exportDaemonEntry, "lines": json.Number("1"), "skipped_invalid": json.Number("1"), "redacted": json.Number("1"), "sources": []any{"mihari-daemon.log"}},
+			map[string]any{"name": exportDaemonEntry, "lines": json.Number("1"), "skipped_invalid": json.Number("1"), "redacted": json.Number("0"), "sources": []any{"mihari-daemon.log"}},
 			map[string]any{"name": exportMihomoEntry, "lines": json.Number("1"), "skipped_invalid": json.Number("0"), "redacted": json.Number("0"), "sources": []any{"mihomo.log"}},
 		},
 		"notes": []any{exportReviewNote},
@@ -282,8 +283,8 @@ func TestExportWithOps_CancellationDuringMultiChunkZipCopyReturnsPromptly(t *tes
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	chunks := 0
-	start := time.Now()
 	_, err := exportWithOps(ctx, ExportRequest{Now: time.Now(), Range: ExportRange{Kind: RangeAll}, OutputPath: filepath.Join(parent, "cancelled.zip"), Paths: paths, PrivateFS: fs}, exportOps{Checkpoint: func(stage exportStage) error {
 		if stage == stageWriteZip {
 			chunks++
@@ -296,8 +297,8 @@ func TestExportWithOps_CancellationDuringMultiChunkZipCopyReturnsPromptly(t *tes
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v", err)
 	}
-	if time.Since(start) > 2*time.Second {
-		t.Fatalf("cancellation took %v", time.Since(start))
+	if chunks != 2 {
+		t.Fatalf("copy checkpoints=%d, want cancellation during second chunk", chunks)
 	}
 	entries, readErr := os.ReadDir(parent)
 	if readErr != nil {
@@ -305,6 +306,34 @@ func TestExportWithOps_CancellationDuringMultiChunkZipCopyReturnsPromptly(t *tes
 	}
 	if len(entries) != 0 {
 		t.Fatalf("resources remain: %v", entries)
+	}
+}
+
+func TestCopySpool_CancelStopsBeforeNextChunk(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const chunkBytes = 32 << 10
+	source := bytes.NewReader(bytes.Repeat([]byte("x"), 4*chunkBytes))
+	var destination bytes.Buffer
+	checkpoints := 0
+	err := copySpool(ctx, source, &destination, exportOps{Checkpoint: func(stage exportStage) error {
+		if stage != stageWriteZip {
+			t.Fatalf("unexpected stage %v", stage)
+		}
+		checkpoints++
+		if checkpoints == 2 {
+			cancel()
+		}
+		return nil
+	}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("copy error=%v, want cancellation", err)
+	}
+	if checkpoints != 2 || destination.Len() < chunkBytes || destination.Len() > 2*chunkBytes {
+		t.Fatalf("checkpoints=%d copied=%d, want at most the in-flight chunk after cancel", checkpoints, destination.Len())
+	}
+	if read := 4*chunkBytes - source.Len(); read > 2*chunkBytes || read != destination.Len() {
+		t.Fatalf("read=%d written=%d, copy continued after cancellation", read, destination.Len())
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,6 +26,7 @@ const (
 type runtimeOutcome struct {
 	err            error
 	remoteEnvelope bool
+	dispatched     bool
 }
 
 func (c *Client) Core(ctx context.Context) (protocol.CoreStatus, error) {
@@ -158,6 +160,7 @@ func (c *Client) UpdateLogging(ctx context.Context, request protocol.LoggingUpda
 		default:
 			if level, report := diagnostics.FailureLevel(ctx, outcome.err); report {
 				reporter(ctx, diagnostics.Record{Component: "control.client", Event: "logging_update_failed", Level: level, Err: outcome.err})
+				outcome.err = diagnostics.MarkReported(outcome.err)
 			}
 		}
 	}
@@ -242,6 +245,13 @@ func (c *Client) Subscription(ctx context.Context, id string) (protocol.Subscrip
 	return result, err
 }
 
+// SubscriptionURL explicitly reveals the current subscription source.
+func (c *Client) SubscriptionURL(ctx context.Context, id string) (protocol.SubscriptionURL, error) {
+	var result protocol.SubscriptionURL
+	err := c.doRuntime(ctx, http.MethodGet, "/v1/subscriptions/"+url.PathEscape(id)+"/url", nil, &result)
+	return result, err
+}
+
 func (c *Client) AddSubscription(ctx context.Context, request protocol.SubscriptionAddRequest) (protocol.SubscriptionResult, error) {
 	var result protocol.SubscriptionResult
 	err := c.doMutation(ctx, logging.OperationMetadata{ID: request.OperationID, Name: "subscription.add"}, http.MethodPost, "/v1/subscriptions", request, &result)
@@ -285,6 +295,13 @@ func (c *Client) doMutation(ctx context.Context, operation logging.OperationMeta
 		reporter(ctx, diagnostics.Record{Component: "control.client", Event: "mutation_started", Level: slog.LevelDebug})
 	}
 	outcome := c.doRuntimeOutcome(ctx, method, path, input, output, maxControlResponseSize)
+	if outcome.err != nil && !outcome.remoteEnvelope && (operation.Name == "subscription.add" || operation.Name == "subscription.set") {
+		if outcome.dispatched {
+			outcome.err = unknownSubscriptionOutcome{outcome.err}
+		} else {
+			outcome.err = unsentSubscriptionOutcome{outcome.err}
+		}
+	}
 	if reporter == nil {
 		return outcome.err
 	}
@@ -296,10 +313,24 @@ func (c *Client) doMutation(ctx context.Context, operation logging.OperationMeta
 	default:
 		if level, report := diagnostics.FailureLevel(ctx, outcome.err); report {
 			reporter(ctx, diagnostics.Record{Component: "control.client", Event: "mutation_failed", Level: level, Err: outcome.err})
+			outcome.err = diagnostics.MarkReported(outcome.err)
 		}
 	}
 	return outcome.err
 }
+
+// unknownSubscriptionOutcome preserves error classification while distinguishing
+// a lost response from an explicit daemon rejection. It never implies rollback.
+type unknownSubscriptionOutcome struct{ error }
+
+// unsentSubscriptionOutcome marks failures before HTTP dispatch as safe to retry.
+type unsentSubscriptionOutcome struct{ error }
+
+func (e unsentSubscriptionOutcome) Unwrap() error        { return e.error }
+func (e unsentSubscriptionOutcome) OutcomeUnknown() bool { return false }
+
+func (e unknownSubscriptionOutcome) Unwrap() error        { return e.error }
+func (e unknownSubscriptionOutcome) OutcomeUnknown() bool { return true }
 
 func (c *Client) Stream(ctx context.Context, kind string, receive func(protocol.StreamEvent) error) error {
 	if receive == nil {
@@ -322,6 +353,8 @@ func (c *Client) Stream(ctx context.Context, kind string, receive func(protocol.
 	token, err := c.requestToken(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
+			// Cancellation keeps the historical nil stream result; reporting owns the error here.
+			_ = c.reportStreamOutcome(ctx, runtimeOutcome{err: err})
 			return nil
 		}
 		return c.reportStreamOutcome(ctx, runtimeOutcome{err: err})
@@ -330,10 +363,12 @@ func (c *Client) Stream(ctx context.Context, kind string, receive func(protocol.
 	connection, response, err := websocket.Dial(ctx, streamURL.String(), &websocket.DialOptions{HTTPClient: c.requestHTTP(), HTTPHeader: header})
 	if err != nil {
 		if ctx.Err() != nil {
+			// Cancellation keeps the historical nil stream result; reporting owns the error here.
+			_ = c.reportStreamOutcome(ctx, runtimeOutcome{err: err})
 			return nil
 		}
 		if response != nil {
-			return c.reportStreamOutcome(ctx, c.responseOutcome(response))
+			return c.reportStreamOutcome(ctx, c.responseOutcome(ctx, response))
 		}
 		return c.reportStreamOutcome(ctx, c.localRuntimeOutcome(err))
 	}
@@ -342,7 +377,13 @@ func (c *Client) Stream(ctx context.Context, kind string, receive func(protocol.
 	for {
 		_, raw, err := connection.Read(ctx)
 		if err != nil {
-			if ctx.Err() != nil || websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+			readErr, quiet := controlStreamReadTermination(ctx, err)
+			if quiet {
+				return nil
+			}
+			if ctx.Err() != nil {
+				// Cancellation keeps the historical nil stream result; reporting owns the error here.
+				_ = c.reportStreamOutcome(ctx, runtimeOutcome{err: readErr})
 				return nil
 			}
 			if errors.Is(err, websocket.ErrMessageTooBig) {
@@ -360,17 +401,86 @@ func (c *Client) Stream(ctx context.Context, kind string, receive func(protocol.
 	}
 }
 
+// controlStreamReadTermination resolves cancellation races without hiding an
+// independent transport failure. Only a single expected termination chain can
+// be replaced by the active context cause; joined siblings remain actual.
+func controlStreamReadTermination(ctx context.Context, err error) (error, bool) {
+	ctxErr := ctx.Err()
+	if ctxErr != nil {
+		if expectedControlStreamTermination(err) {
+			return ctxErr, false
+		}
+		return err, false
+	}
+	if normalControlStreamClose(err) {
+		return nil, true
+	}
+	return err, false
+}
+
+func expectedControlStreamTermination(err error) bool {
+	return singleControlStreamTermination(err, true)
+}
+
+func normalControlStreamClose(err error) bool {
+	return singleControlStreamTermination(err, false)
+}
+
+func singleControlStreamTermination(err error, allowInduced bool) bool {
+	const maxDepth = 32
+	for depth := 0; err != nil && depth < maxDepth; depth++ {
+		if joined, ok := err.(interface{ Unwrap() []error }); ok {
+			children := joined.Unwrap()
+			if len(children) != 1 {
+				return false
+			}
+			err = children[0]
+			continue
+		}
+		if normalControlStreamCloseValue(err) {
+			return true
+		}
+		if allowInduced {
+			switch err {
+			case net.ErrClosed, io.EOF, context.Canceled, context.DeadlineExceeded:
+				return true
+			}
+		}
+		unwrapper, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = unwrapper.Unwrap()
+	}
+	return false
+}
+
+func normalControlStreamCloseValue(err error) bool {
+	switch closeErr := err.(type) {
+	case websocket.CloseError:
+		return closeErr.Code == websocket.StatusNormalClosure
+	case *websocket.CloseError:
+		return closeErr != nil && closeErr.Code == websocket.StatusNormalClosure
+	default:
+		return false
+	}
+}
+
 // reportStreamOutcome owns local transport/decode failures and remote response
 // outcomes. Callback errors belong to the caller and never enter this path.
 func (c *Client) reportStreamOutcome(ctx context.Context, outcome runtimeOutcome) error {
+	return c.reportRuntimeOutcome(ctx, outcome, "stream_failed", "stream_response")
+}
+
+func (c *Client) reportRuntimeOutcome(ctx context.Context, outcome runtimeOutcome, failureEvent, responseEvent string) error {
 	reporter := c.diagnosticReporter()
 	if reporter == nil || diagnostics.AlreadyReported(outcome.err) {
 		return outcome.err
 	}
-	event := "stream_failed"
+	event := failureEvent
 	level, report := diagnostics.FailureLevel(ctx, outcome.err)
 	if outcome.remoteEnvelope {
-		event, level, report = "stream_response", slog.LevelDebug, true
+		event, level, report = responseEvent, slog.LevelDebug, true
 	}
 	if report {
 		reporter(ctx, diagnostics.Record{Component: "control.client", Event: event, Level: level, Err: outcome.err})
@@ -384,21 +494,22 @@ func (c *Client) doRuntime(ctx context.Context, method, path string, input, outp
 }
 
 func (c *Client) doRuntimeLimit(ctx context.Context, method, path string, input, output any, responseLimit int64) error {
-	return c.doRuntimeOutcome(ctx, method, path, input, output, responseLimit).err
+	outcome := c.doRuntimeOutcome(ctx, method, path, input, output, responseLimit)
+	return c.reportRuntimeOutcome(ctx, outcome, "request_failed", "request_response")
 }
 
-func (c *Client) doRuntimeOutcome(ctx context.Context, method, path string, input, output any, responseLimit int64) runtimeOutcome {
+func (c *Client) doRuntimeOutcome(ctx context.Context, method, path string, input, output any, responseLimit int64) (outcome runtimeOutcome) {
 	var body io.Reader
 	if input != nil {
 		raw, err := json.Marshal(input)
 		if err != nil {
-			return runtimeOutcome{err: protocol.APIError{Code: protocol.CodeInternal, Message: "encode control request"}}
+			return runtimeOutcome{err: diagnostics.Wrap(protocol.APIError{Code: protocol.CodeInternal, Message: "encode control request"}, err)}
 		}
 		body = bytes.NewReader(raw)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
 	if err != nil {
-		return runtimeOutcome{err: protocol.APIError{Code: protocol.CodeInternal, Message: "create control request"}}
+		return runtimeOutcome{err: diagnostics.Wrap(protocol.APIError{Code: protocol.CodeInternal, Message: "create control request"}, err)}
 	}
 	token, err := c.requestToken(ctx)
 	if err != nil {
@@ -418,14 +529,16 @@ func (c *Client) doRuntimeOutcome(ctx context.Context, method, path string, inpu
 			request.ContentLength = -1
 		}
 	}
+	// Every return after Do may describe a request that reached the daemon.
+	defer func() { outcome.dispatched = true }()
 	response, err := c.requestHTTP().Do(request)
 	if err != nil {
 		return c.localRuntimeOutcome(err)
 	}
-	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return c.responseOutcome(response)
+		return c.responseOutcome(ctx, response)
 	}
+	defer c.closeRuntimeResponse(ctx, response, &outcome)
 	raw, err := io.ReadAll(io.LimitReader(response.Body, responseLimit+1))
 	if err != nil {
 		return c.localRuntimeOutcome(err)
@@ -441,7 +554,6 @@ func (c *Client) doRuntimeOutcome(ctx context.Context, method, path string, inpu
 }
 
 func decodeRuntimeHTTPErrorOutcome(response *http.Response) (error, bool) {
-	defer response.Body.Close()
 	var envelope protocol.ErrorEnvelope
 	if err := json.NewDecoder(io.LimitReader(response.Body, maxControlResponseSize)).Decode(&envelope); err != nil {
 		return diagnostics.Wrap(protocol.APIError{Code: protocol.CodeDataFailure, Message: "invalid control error response"}, err), false
@@ -450,6 +562,26 @@ func decodeRuntimeHTTPErrorOutcome(response *http.Response) (error, bool) {
 		return protocol.APIError{Code: protocol.CodeDataFailure, Message: "invalid control error response"}, false
 	}
 	return envelope.Error, true
+}
+
+// closeRuntimeResponse keeps local cleanup causes with the local failure owner.
+// A valid response remains valid when cleanup alone fails.
+func (c *Client) closeRuntimeResponse(ctx context.Context, response *http.Response, outcome *runtimeOutcome) {
+	if err := response.Body.Close(); err != nil {
+		if outcome.err != nil && !outcome.remoteEnvelope {
+			var api protocol.APIError
+			if errors.As(outcome.err, &api) {
+				outcome.err = diagnostics.Wrap(api, errors.Join(outcome.err, err))
+			} else {
+				outcome.err = errors.Join(outcome.err, err)
+			}
+			return
+		}
+		if reporter := c.diagnosticReporter(); reporter != nil {
+			level, _ := diagnostics.FailureLevel(ctx, err)
+			reporter(ctx, diagnostics.Record{Component: "control.client", Event: "response.close_failed", Level: min(level, slog.LevelWarn), Err: err})
+		}
+	}
 }
 
 func (c *Client) localRuntimeOutcome(cause error) runtimeOutcome {

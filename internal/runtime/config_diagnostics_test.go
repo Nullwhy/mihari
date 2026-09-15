@@ -145,22 +145,23 @@ func TestConfigDiagnostic_ReloadCompensation(t *testing.T) {
 				t.Fatalf("expected one final JSON record: %v", decodeErr)
 			}
 			causeText, _ := record["cause"].(string)
-			if record["operation_id"] != "config-failure" || record["operation"] != "subscription.refresh" || record["msg"] != "operation.failed" || record["level"] != "ERROR" || !strings.Contains(causeText, "path operation open") {
+			if record["operation_id"] != "config-failure" || record["operation"] != "subscription.refresh" || record["msg"] != "operation.failed" || record["level"] != "ERROR" || !strings.Contains(causeText, first.Error()) {
 				t.Errorf("final JSON record=%#v", record)
 			}
-			if (mode == "second_reload" || mode == "restore") && !strings.Contains(causeText, "path operation read") {
+			if (mode == "second_reload" || mode == "restore") && !strings.Contains(causeText, second.Error()) {
 				t.Error("second failure summary missing from JSON")
 			}
-			for _, secret := range []string{"first-secret", "second-secret", "proxies:"} {
-				if strings.Contains(output.String(), secret) {
-					t.Error("unsafe detail in diagnostic output")
-				}
+			if strings.Contains(output.String(), "proxies:") {
+				t.Error("logger read configuration that was not part of the failure")
 			}
 			if calls != 2 {
 				t.Fatalf("reload calls=%d", calls)
 			}
 			if mode != "restore" && !bytes.Equal(before, configDiagnosticRead(t, m.runtimeConfig)) {
 				t.Error("previous config not restored")
+			}
+			if mode == "restored" {
+				catalog.Profiles[0].LastError = wantMessage
 			}
 			if mode != "receipt" && !reflect.DeepEqual(catalog, m.Subscriptions()) {
 				t.Error("catalog/cache generation not rolled back")
@@ -236,6 +237,7 @@ func TestConfigDiagnostic_ValidationFailureSafeJSON(t *testing.T) {
 	if !errors.Is(err, cause) || err.Error() != "mihomo configuration validation failed" {
 		t.Fatalf("validation contract/cause: %v", err)
 	}
+	catalog.Profiles[0].LastError = "mihomo configuration validation failed"
 	if !bytes.Equal(before, configDiagnosticRead(t, m.runtimeConfig)) || c.reloads != reloads || !reflect.DeepEqual(catalog, m.Subscriptions()) || !reflect.DeepEqual(snapshot, m.Snapshot()) {
 		t.Fatal("validation changed last valid state or reloaded")
 	}
@@ -247,12 +249,12 @@ func TestConfigDiagnostic_ValidationFailureSafeJSON(t *testing.T) {
 	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
 		t.Fatalf("expected one JSON diagnostic: %v", err)
 	}
-	if record["operation_id"] != "validation-failure" || record["operation"] != "subscription.refresh" || record["msg"] != "operation.failed" || record["level"] != "ERROR" || !strings.Contains(record["cause"].(string), "command execution failed") {
+	if record["operation_id"] != "validation-failure" || record["operation"] != "subscription.refresh" || record["msg"] != "operation.failed" || record["level"] != "ERROR" || !strings.Contains(record["cause"].(string), string(cause.Stderr)) {
 		t.Fatalf("record=%#v", record)
 	}
 	for _, secret := range []string{"candidate-secret", "proxies:", "password:"} {
-		if strings.Contains(output.String(), secret) {
-			t.Fatal("configuration leaked into diagnostics")
+		if !strings.Contains(output.String(), secret) {
+			t.Fatal("configuration validation stderr lost original content")
 		}
 	}
 }
@@ -304,6 +306,7 @@ func TestConfigDiagnostic_IOFailuresKeepPreviousState(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			catalog.Profiles[0].LastError = message
 			if c.reloads != reloads || !bytes.Equal(before, configDiagnosticRead(t, m.runtimeConfig)) || !reflect.DeepEqual(catalog, m.Subscriptions()) || !reflect.DeepEqual(snapshot, m.Snapshot()) {
 				t.Fatal("failed preparation/publication changed valid state")
 			}

@@ -18,6 +18,7 @@ const (
 	ActionUpdateMihari            Action = "update-mihari"
 	ActionApplyEndpointChange     Action = "apply-endpoint-change"
 	ActionSelectProxy             Action = "select-proxy"
+	ActionSetRouting              Action = "set-routing"
 	ActionCloseConnection         Action = "close-connection"
 	ActionRefreshSubscription     Action = "refresh-subscription"
 	ActionRefreshAllSubscriptions Action = "refresh-all-subscriptions"
@@ -66,8 +67,10 @@ type ActionIntentMsg struct {
 	Object     string
 	Impact     string
 	Rollback   string
-	Execute    tea.Cmd
-	Cancel     tea.Cmd
+	// MihariUpdate provides structured copy only for the self-update confirmation.
+	MihariUpdate *MihariUpdateConfirmation
+	Execute      tea.Cmd
+	Cancel       tea.Cmd
 }
 
 // CompleteUninstallConfirmedMsg marks an explicitly confirmed full uninstall.

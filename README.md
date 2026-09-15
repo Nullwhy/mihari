@@ -40,8 +40,18 @@ Specifically:
 - **Web panels**: one-click install / update / activate / rollback for zashboard and MetaCubeXD, served behind a loopback Web gateway with its own access credential.
 - **System proxy & TUN**: cross-platform system proxy control and managed TUN, both daemon-owned and persisted. Enable refuses a foreign system proxy (`system_proxy_conflict`) or another TUN / mihomo instance (`tun_conflict`) unless `--force` (TUI asks for confirmation).
 - **Ports Config**: the System page can change Mixed / Controller / Web ports; occupancy shows `Owned` or `Occupied by name (pid)`. Applying a change typically requires a daemon restart.
-- **In-TUI Mihari updates**: the System page checks GitHub Releases on entry, shows `current · latest available` or `current · Up to date`, and—when Mihari was started with administrator/root privileges—replaces the binary, synchronizes and restarts an installed OS-service copy, verifies its daemon version, and automatically enters the updated TUI.
+- **In-TUI Mihari updates**: the System page checks GitHub Releases on entry, shows `current · latest available` or `current · Up to date`, and—when Mihari was started with administrator/root privileges—replaces the binary, synchronizes and restarts an installed OS-service copy, verifies its daemon version, and automatically enters the updated TUI. The update confirmation keeps safe nonstandard installed build labels as `Unknown[label]`; compatibility remains unknown. Long confirmation content scrolls with ↑/↓ or PgUp/PgDn, with Cancel selected by default.
 - **Core channel**: the System page can switch the mihomo core between `stable` and `alpha`.
+
+On Windows, updates can query the version of a user-owned installation (including the default AppData location) using the same user's non-administrator token. Unsafe directory permissions or an unavailable filtered UAC token still leave the version unknown; version probing never elevates a user-writable executable.
+
+Proxy latency tests discover provider nodes and use mihomo's provider-specific endpoint when needed. Duplicate names appear once per group and share a test result: a global node takes priority, otherwise the first matching provider in name order is used. The first successful node check after TUI startup warns about duplicates; the tested source may differ from the group's selected source. Provider reads retry transient failures up to three times. If a refresh still fails, Proxies retains the last snapshot with a **Stale data** notice and the key error; the notice clears after recovery. CLI/TUI and daemon should be upgraded together.
+
+While a TUI proxy latency test is running, its node card shows only an animated Braille spinner beside the protocol.
+
+The TUI subscription table sizes Name and Traffic to their contents, capped at 32 and 24 terminal columns. Extra width stays on the right; narrow terminals hide lower-priority fields first.
+
+Mihomo HTTP failures retain their original error text and upstream status in diagnostic logs, including gateway requests and WebSocket handshakes. File logs and exports are not redacted: credentials, URLs, paths, and configuration fragments carried by errors remain available for diagnosis. User-facing errors remain concise.
 
 A single CGO-free static binary (< 15 MB) contains everything, with built-in GitHub Releases self-update and local GeoIP resolution.
 
@@ -112,7 +122,11 @@ See [docs/distribution.md](docs/distribution.md) for the offline distribution de
 mihari
 ```
 
-The interactive setup installs the mihomo core, guides you through adding your first subscription, and prepares local GeoIP data. It pre-checks the managed ports up front (with one-key auto-fix on conflict), reuses any local core/GeoIP already present, and the final review summarizes ports, core, subscription, GeoIP and service registration.
+The interactive setup uses the shared TUI theme and a step-by-step layout, with the current action, an animated waiting indicator and elapsed time. Failures show a safe explanation and next action; press F2 for scrollable, copyable diagnostic details.
+
+Confirmed endpoint changes are saved immediately by the daemon. Saved resources survive interruption; reopening checks required ports/core and resumes missing setup, without requiring optional subscriptions or GeoIP. Core shows local readiness, version, channel and runtime state; GeoIP shows Country/ASN availability and update times separately. Existing subscriptions remain visible as an overview with counts, per-profile state and the current selection; Enter continues without changing them. Add more or manage existing profiles on the Subscriptions page. If a newly registered subscription's first download fails, retry refreshes that same subscription.
+
+Esc during an operation asks to cancel, then checks daemon settlement and saved state. An unknown result is not proof that nothing was saved: recheck or exit without blindly resubmitting. Ctrl+Q confirms exit. A confirmed startup port conflict exposes restricted endpoint recovery over authenticated local IPC; other business mutations remain unavailable. After changing ports, restart the daemon and recheck (or wait for reconnection). Service ownership cannot currently be verified, so setup does not automatically restart a potentially different service instance.
 
 **Add a subscription and enable the system proxy**
 
@@ -130,6 +144,7 @@ mihari sysproxy enable
 | View status | `mihari status` |
 | Core management | `mihari core status` · `mihari core restart` |
 | Proxy groups | `mihari proxy groups` · `mihari proxy select <GROUP> <PROXY>` |
+| Routing mode | `mihari proxy mode [rule\|global\|direct]` · `mihari proxy select GLOBAL <PROXY>` |
 | Subscription management | `mihari sub add <NAME> <URL>` · `mihari sub set <ID> --proxy auto` · `mihari sub use <ID>` |
 | System proxy / TUN | `mihari sysproxy enable` · `mihari sysproxy enable --force` · `mihari tun enable` · `mihari tun enable --force` |
 | Web panels | `mihari panel list` · `mihari panel open` |
@@ -138,6 +153,22 @@ mihari sysproxy enable
 | Update mihari | System page `Update Mihari` · `mihari self update` |
 
 See [docs/commands.md](docs/commands.md) for the full command reference, and [docs/architecture.md](docs/architecture.md) for the architecture and security model.
+
+In TUI **Proxies**, the **Routing** card contains **Mode** and **GLOBAL**. Focus **Mode** and press Enter to choose Rule, Global, or Direct; use ↑/↓, Enter to apply, and Esc to cancel. **GLOBAL** expands the core's existing candidate group and scrolls to show the whole section when it fits; larger groups start at the top of the list viewport and remain navigable with the arrow keys. Mihari saves the mode globally and the GLOBAL exit per subscription, including choices made by supported Web panels. Rule is the default. Mode and exit changes preserve existing connections. If a saved exit disappears, Mihari saves DIRECT when available, otherwise Rule; a stopped core shows saved changes as pending.
+
+Routing uses white labels and green values. Only the focused row shows `· Press Enter to Change` or `· Press Enter to Select` immediately after its value; narrow windows hide the action hint to preserve the value. Status explanations remain visible without focus.
+
+Selected proxy cards use a blue **●** marker in the same color as **INFO** log entries. Each Proxies group, including GLOBAL, has **→ Jump to Selected** beside its current selection (shortened to **→ Selected** in narrow windows). On the group header, press → to focus the button and Enter to expand the group and scroll to its selected card; ← returns to the header. This only moves keyboard focus. Later refreshes do not move that focus when the selection changes. The button remains usable with retained **Last selected** data, and is disabled when the selection is empty or absent from the candidate list.
+
+In TUI **Subs**, Enter opens editable details; `a` adds a profile. Use Tab/Shift+Tab or ↑/↓ to move between fields, and ←/→/Space to cycle **Auto refresh** or **Mode**. Enter advances to the next field; only Enter on **Save** submits. PgUp/PgDn scroll the details; long URLs scroll horizontally. All built-in TUI text is English. The list uses **InUse**, **Enabled**, **Status**, and **Mode**; `p` cycles fetch mode.
+
+Adding and editing share a compact centered form. Details group the live status above the settings; empty errors stay hidden and timestamps use local time to the minute. In short windows the body scrolls while **Save** stays visible. Cycle fields use reverse highlighting; text fields use a lightened input background and white cursor. Contextual shortcuts appear once at the bottom of the terminal. An empty **Interval** shows the current global interval as a placeholder; leaving it blank keeps inheritance.
+
+Changing a subscription URL preserves its existing cache and InUse selection, without downloading or reloading immediately. **Outdated** means the cache came from another URL; you can still use it offline. Changing a profile's interval resets its next refresh and marks its cache **Expired** until a successful refresh, including a valid 304 response. Higher-priority states such as Disabled, Failed, Missing, and Outdated still take precedence. With Auto refresh off, Next shows **Manual**.
+
+Save waits for a result before closing. A revision conflict asks whether to overwrite only your changed fields. If the result is unknown, Mihari checks the operation and current state without replaying the save; **Submit again** requires another confirmation and can create a duplicate when adding. Closing does not cancel a save. If a profile was created but its first download failed, select it and press `r` to retry the download.
+
+Upgrade the TUI and daemon together; mixed versions are not supported. Before upgrading, stop the daemon and back up the complete business data for your layout (Unix B/D, or Windows/private P), including catalog, caches, settings/state, and runtime configuration as one consistent set. New catalog fields cannot be read by old binaries. Direct downgrade is unsupported: stop the daemon and restore a compatible complete backup when reverting the binary. Removing individual YAML fields is not a supported downgrade procedure.
 
 ## Platform targets
 
@@ -177,11 +208,15 @@ Logging appears between Network and About. Unix shows separate machine and curre
 
 On Windows, private logs grant the individual data user and LocalSystem access, including when an elevated process created an Administrators-owned data directory. Writer startup repairs existing daemon, TUI and mihomo logs, retained archives and lock files without changing their contents. Running services refresh the root permission policy when creating or hardening files, preserving the repaired user access after rotation. If an older version removed ordinary-user access, the updated application must run once with administrator privileges to repair it. The elevated in-TUI update flow starts the new TUI with those privileges; users who replace the binary manually may need an elevated first start.
 
-System Unix exports use `mihari-logs-export/v2`, combining authenticated machine snapshots with current-user logs. Offline export requires explicitly choosing current-user logs only. Windows/explicit private P retain local v1. An archive contains `manifest.json` plus only the non-empty fixed entries `daemon/mihari-daemon.log`, `tui/mihari-tui.log`, and `mihomo/mihomo.log`. Records are parsed, filtered, recursively redacted a second time, and re-encoded rather than copied as raw JSONL. Object members whose keys contain recognized credentials or URLs are omitted; ordinary sibling fields are preserved. Known credentials and URLs are removed, but node names, destination domains/IP addresses, and traffic metadata may remain—inspect those fields before sending an archive.
+System Unix exports use `mihari-logs-export/v2`, combining authenticated machine snapshots with current-user logs. Offline export requires explicitly choosing current-user logs only. Windows/explicit private P retain local v1. An archive contains `manifest.json` plus only the non-empty fixed entries `daemon/mihari-daemon.log`, `tui/mihari-tui.log`, and `mihomo/mihomo.log`. Records are validated and filtered by time while preserving the original JSON record bytes. Neither snapshots nor exports redact their content. The export dialog shows a red notice before export and after completion: logs may contain passwords, access tokens, full subscription URLs, and user configuration. Review them before sharing.
+
+Diagnostic text, retained HTTP failure bodies, and logical mihomo output lines each have a 256 KiB limit, with explicit truncation indicators. JSON escaping can make a record larger than the existing snapshot limit; such records use bounded fragments carrying `record_id`, `fragment_index`, and `fragment_count`. Missing fragments remain identifiable after rotation or an interrupted write. Existing stacks are retained; ordinary errors do not trigger new stack capture.
+
+Errors use the currently available file logger. Ordinary CLI commands do not create logs or open historical log files. Expected rejections and active cancellation are recorded at INFO, recoverable failures and retry attempts at WARN, and final failures at ERROR, subject to the configured level. A failure is recorded by its execution owner; replaying the same result does not duplicate it.
 
 Export keeps the opened destination-directory identity for the entire operation and will not follow a path replaced while the archive is being generated. On Unix, cleanup assumes the same UID and local root/administrators are trusted. An untrusted shared parent can therefore leave an empty private workspace after its contents were removed, even if its permissions were tightened during export; a cleanup I/O failure reports that content may remain. A destination directory renamed externally after successful publication can also make the displayed absolute path stale.
 
-Older binaries decode `mihari.yaml` with `KnownFields(true)` and cannot read a custom `log:` block. Before downgrading, use System → Logging to restore `info` / 10 MiB / 3 files, which removes that block automatically; alternatively, back up the settings file and remove `log:` manually. Redaction is best effort only. Treat all log files as sensitive material and share them only after reviewing their contents.
+Older binaries decode `mihari.yaml` with `KnownFields(true)` and cannot read a custom `log:` block. Before downgrading, use System → Logging to restore `info` / 10 MiB / 3 files, which removes that block automatically; alternatively, back up the settings file and remove `log:` manually. Historical redacted logs cannot be restored to their original content, and older clients may still redact exported records.
 
 ## Development
 

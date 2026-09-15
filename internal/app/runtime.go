@@ -117,12 +117,14 @@ func BuildRuntimeWithOptions(paths platform.Paths, settings config.Settings, dae
 		CatalogPath: paths.SubscriptionCatalog,
 		CacheDir:    paths.SubscriptionCache,
 		ProxyAddr:   settings.MixedAddr,
+		Reporter:    options.DiagnosticReporter,
 	})
 	if err != nil {
 		return nil, err
 	}
-	installer := core.Installer{}
+	installer := core.Installer{Reporter: options.DiagnosticReporter}
 	if options.TrustedCore != nil {
+		options.TrustedCore.SetDiagnosticReporter(options.DiagnosticReporter)
 
 		if err := core.RecoverProvenance(context.Background(), options.TrustedCore.Provenance()); err != nil {
 			return nil, err
@@ -159,6 +161,7 @@ func BuildRuntimeWithOptions(paths platform.Paths, settings config.Settings, dae
 	}
 	coordinator := state.NewCoordinator(store)
 	controller := mihomo.NewClient("http://"+settings.ControllerAddr, settings.ControllerSecret, nil)
+	controller.SetDiagnosticReporter(options.DiagnosticReporter)
 	// A persisted active subscription already had its generated config installed
 	// into the runtime config file; without this the status API would report
 	// "Not applied" after every daemon restart until the next subscription op.
@@ -176,7 +179,8 @@ func BuildRuntimeWithOptions(paths platform.Paths, settings config.Settings, dae
 	geoIPService := geoip.New(geoip.ServiceOptions{
 		CountryPath: paths.GeoIPCountry,
 		ASNPath:     paths.GeoIPASN,
-		Downloader:  geoip.Downloader{StagingDir: paths.GeoIPStaging},
+		Reporter:    options.DiagnosticReporter,
+		Downloader:  geoip.Downloader{StagingDir: paths.GeoIPStaging, Reporter: options.DiagnosticReporter},
 	})
 	settingsPath := options.SettingsPath
 	if settingsPath == "" {
@@ -199,11 +203,16 @@ func BuildRuntimeWithOptions(paths platform.Paths, settings config.Settings, dae
 	if err != nil {
 		return nil, err
 	}
+	zashboardAdapter := zashboard.New(nil, "")
+	zashboardAdapter.Client.Reporter = options.DiagnosticReporter
+	metacubexdAdapter := metacubexd.New(nil, "")
+	metacubexdAdapter.Client.Reporter = options.DiagnosticReporter
 	panelService, err := panel.Open(panel.ServiceOptions{
 		WebRoot: paths.WebRoot, WebActive: paths.WebActive, StagingDir: paths.PanelStaging,
+		Reporter: options.DiagnosticReporter,
 		Adapters: []panel.Adapter{
-			zashboard.New(nil, ""),
-			metacubexd.New(nil, ""),
+			zashboardAdapter,
+			metacubexdAdapter,
 		},
 	})
 	if err != nil {
@@ -253,6 +262,9 @@ func BuildRuntimeWithOptions(paths platform.Paths, settings config.Settings, dae
 		DiagnosticReporter: options.DiagnosticReporter,
 		Health: func(ctx context.Context) error {
 			_, err := controller.Version(ctx)
+			if err == nil && manager != nil {
+				err = manager.RestoreRouting(ctx)
+			}
 			return err
 		},
 		Observe: func(observation supervisor.Observation) {
@@ -306,6 +318,7 @@ func BuildRuntimeWithOptions(paths platform.Paths, settings config.Settings, dae
 		RunScheduler: func(ctx context.Context) error {
 			subScheduler := subscription.NewScheduler(subscription.SchedulerOptions{
 				Snapshot: subscriptions.Snapshot,
+				Changes:  manager.SubscriptionChanges(),
 				Refresh:  schedulerSubscriptionRefresh(manager.RefreshSubscription, time.Now),
 			})
 			geoScheduler := geoip.Scheduler{
@@ -356,7 +369,7 @@ func runSchedulers(ctx context.Context, subscriptionRun, geoIPRun func(context.C
 		}
 		if reporter != nil {
 			reporter(ctx, diagnostics.Record{Component: component, Event: "background.failed", Level: level, Err: err})
-		} else if onBackgroundError != nil {
+		} else if onBackgroundError != nil && !diagnostics.NormalCancellation(ctx, err) {
 			onBackgroundError(component, err)
 		}
 	}
@@ -460,7 +473,7 @@ func BuildValidationRuntime(ctx context.Context, paths platform.Paths, settings 
 		}
 		file, err := os.Open(filepath.Join(paths.SubscriptionCache, profile.ID+".yaml"))
 		if err != nil {
-			return nil, protocol.APIError{Code: protocol.CodeDataFailure, Message: "subscription cache is unavailable"}
+			return nil, diagnostics.Wrap(protocol.APIError{Code: protocol.CodeDataFailure, Message: "subscription cache is unavailable"}, err)
 		}
 		raw, readErr := io.ReadAll(io.LimitReader(validationContextReader{ctx: ctx, reader: file}, (16<<20)+1))
 		if err = errors.Join(readErr, file.Close()); err != nil {
@@ -511,18 +524,18 @@ func startupConfig(subscriptions *subscription.Service, settings config.Settings
 		}
 		_, cached, err := subscriptions.ReadCache(catalog.ActiveID)
 		if err != nil {
-			return nil, startupCacheError()
+			return nil, startupCacheError(err)
 		}
 		document = cached
 	}
 	content, err := subscription.Generate(document, nil, settings)
 	if err != nil {
-		return nil, startupCacheError()
+		return nil, startupCacheError(err)
 	}
 	return content, nil
 }
-func startupCacheError() error {
-	return protocol.APIError{Code: protocol.CodeDataFailure, Message: "active subscription cache is unavailable"}
+func startupCacheError(causes ...error) error {
+	return diagnostics.Wrap(protocol.APIError{Code: protocol.CodeDataFailure, Message: "active subscription cache is unavailable"}, errors.Join(causes...))
 }
 
 type webMutationRuntime interface {
@@ -580,8 +593,24 @@ func (m webMutator) timestamp() string {
 	return now().UTC().Format("20060102T150405.000000000")
 }
 
-// ApplyConfigPatch applies allowlisted config mutations (currently TUN only) via the coordinator.
+// ApplyConfigPatch applies one allowlisted routing or TUN mutation via the coordinator.
 func (m webMutator) ApplyConfigPatch(ctx context.Context, patch map[string]any) error {
+	if raw, exists := patch["mode"]; exists {
+		mode, ok := raw.(string)
+		if len(patch) != 1 || !ok || !protocol.ValidRoutingMode(mode) {
+			return protocol.APIError{Code: protocol.CodeInvalidArgument, Message: "invalid routing patch"}
+		}
+		op := runtimeapi.Operation{ID: "web-routing-" + m.newWebOperationID(), Source: "web"}
+		ctx = logging.WithOperation(ctx, logging.OperationMetadata{ID: op.ID, Name: "routing.update"})
+		routing, ok := m.manager.(interface {
+			UpdateRouting(context.Context, runtimeapi.Operation, string) (protocol.RoutingStatus, error)
+		})
+		if !ok {
+			return protocol.APIError{Code: protocol.CodeInvalidState, Message: "routing mode is unavailable"}
+		}
+		_, err := routing.UpdateRouting(ctx, op, mode)
+		return m.reportResult(ctx, err)
+	}
 	tunRaw, ok := patch["tun"]
 	if !ok {
 		return protocol.APIError{

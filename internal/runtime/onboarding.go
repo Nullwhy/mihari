@@ -5,6 +5,7 @@ import (
 
 	"github.com/mihari-proxy/mihari/internal/config"
 	"github.com/mihari-proxy/mihari/internal/control/protocol"
+	"github.com/mihari-proxy/mihari/internal/diagnostics"
 	"github.com/mihari-proxy/mihari/internal/onboarding"
 	"github.com/mihari-proxy/mihari/internal/state"
 	"github.com/mihari-proxy/mihari/internal/subscription"
@@ -22,6 +23,35 @@ func (m *Manager) OnboardingStatus(ctx context.Context) (onboarding.Snapshot, er
 		Status:   m.composeOnboardingStatus(m.onboarding.State()),
 		Revision: m.store.Load().Revision,
 	}, nil
+}
+
+// SetupRequired derives required setup from effective runtime resources. Optional
+// subscriptions/GeoIP and the historical welcome marker do not force onboarding.
+func (m *Manager) SetupRequired(ctx context.Context) (bool, error) {
+	if m.onboarding == nil {
+		return false, nil
+	}
+	status, err := m.OnboardingStatus(ctx)
+	if err != nil {
+		return false, err
+	}
+	if status.Status.RestartRequired {
+		return true, nil
+	}
+	coreState := m.store.Load().Core
+	if !m.binaryExists() || coreState.Status == "missing" {
+		return true, nil
+	}
+	// A known running/starting or previously validated core is not missing
+	// configuration merely because runtime health is temporarily degraded.
+	if m.installer != nil && coreState.Version == "" && coreState.Status != "running" && coreState.Status != "starting" {
+		local, err := m.LocalCore(ctx)
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return !local.Ready, err
+	}
+	return false, nil
 }
 
 func (m *Manager) UpdateOnboarding(ctx context.Context, operation Operation, update onboarding.Update) (onboarding.Snapshot, error) {
@@ -47,7 +77,7 @@ func (m *Manager) UpdateOnboarding(ctx context.Context, operation Operation, upd
 			if err != nil {
 				return nil, err
 			}
-			defer generated.cleanup()
+			defer func() { collectWarning(ctx, "onboarding", "candidate.cleanup.failed", generated.cleanup()) }()
 			// The controller and health clients retain startup endpoints.
 			// Validate now; daemon restart regenerates and publishes using
 			// persisted settings before constructing those clients.
@@ -137,6 +167,6 @@ func (m *Manager) composeOnboardingStatus(onboardingState onboarding.State) onbo
 	}
 }
 
-func mapPersistError(error) error {
-	return protocol.APIError{Code: protocol.CodeDataFailure, Message: "persist settings"}
+func mapPersistError(err error) error {
+	return diagnostics.Wrap(protocol.APIError{Code: protocol.CodeDataFailure, Message: "persist settings"}, err)
 }

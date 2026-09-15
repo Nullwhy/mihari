@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"path/filepath"
@@ -144,7 +145,8 @@ type WebGateway interface {
 }
 
 type Manager struct {
-	trustedCore *core.TrustedExecution
+	routingMessage string // guarded by mutation ownership
+	trustedCore    *core.TrustedExecution
 
 	store                     *state.Store
 	coordinator               *state.Coordinator
@@ -184,6 +186,7 @@ type Manager struct {
 	configGeneration          uint64
 	tunLastError              string
 	maintenance               chan struct{}
+	subscriptionChanges       chan struct{}
 	installed                 chan struct{}
 	closing                   atomic.Bool
 	mutationDegraded          atomic.Bool
@@ -278,6 +281,7 @@ func New(options Options) *Manager {
 		installed:          make(chan struct{}, 1),
 		operations:         make(map[string]*operationEntry),
 	}
+	manager.subscriptionChanges = make(chan struct{}, 1)
 	manager.maintenance <- struct{}{}
 	if manager.subscriptions != nil {
 		snapshot := manager.store.Load()
@@ -297,7 +301,11 @@ func (m *Manager) Run(ctx context.Context) error {
 		return protocol.APIError{Code: protocol.CodeInvalidState, Message: "install activation is required"}
 	}
 	if closer, ok := m.geoip.(interface{ Close() error }); ok {
-		defer func() { _ = closer.Close() }()
+		defer func() {
+			if err := closer.Close(); err != nil {
+				m.reportWarning(ctx, "geoip", "cleanup.failed", err)
+			}
+		}()
 	}
 	if m.webGateway != nil {
 		webDone := make(chan struct{})
@@ -344,12 +352,21 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 	m.running.Store(true)
 	// Best-effort restore of desired OS system proxy; failures must not block core supervision.
-	_ = m.ApplyDesiredSystemProxy(ctx)
-	defer func() { _ = m.ClearOwnedSystemProxy(context.Background()) }()
+	if err := m.ApplyDesiredSystemProxy(ctx); err != nil {
+		m.reportWarning(ctx, "system-proxy", "restore.failed", err)
+	}
+	defer func() {
+		if err := m.ClearOwnedSystemProxy(context.Background()); err != nil {
+			m.reportWarning(ctx, "system-proxy", "cleanup.failed", err)
+		}
+	}()
 	err := m.supervisor.Run(ctx)
 	m.running.Store(false)
 	if ctx.Err() != nil {
-		return nil
+		if err == nil || diagnostics.NormalCancellation(ctx, err) {
+			return nil
+		}
+		return err
 	}
 	if err != nil {
 		m.setCoreState(state.CoreState{Status: "degraded", LastError: "mihomo supervisor stopped"})
@@ -359,6 +376,20 @@ func (m *Manager) Run(ctx context.Context) error {
 
 func (m *Manager) reportBackground(component string, err error) {
 	m.reportBackgroundContext(context.Background(), component, err)
+}
+
+func (m *Manager) reportWarning(ctx context.Context, component, event string, err error) {
+	if err == nil || m.diagnosticReporter == nil || diagnostics.AlreadyReported(err) {
+		return
+	}
+	level, emit := diagnostics.FailureLevel(ctx, err)
+	if !emit {
+		return
+	}
+	if level > slog.LevelWarn {
+		level = slog.LevelWarn
+	}
+	m.diagnosticReporter(ctx, diagnostics.Record{Component: component, Event: event, Level: level, Err: err})
 }
 
 func (m *Manager) reportBackgroundContext(ctx context.Context, component string, err error) {
@@ -371,7 +402,7 @@ func (m *Manager) reportBackgroundContext(ctx context.Context, component string,
 	}
 	if m.diagnosticReporter != nil {
 		m.diagnosticReporter(ctx, diagnostics.Record{Component: component, Event: "background.failed", Level: level, Err: err})
-	} else if m.onBackgroundError != nil {
+	} else if m.onBackgroundError != nil && !diagnostics.NormalCancellation(ctx, err) {
 		m.onBackgroundError(component, err)
 	}
 }
@@ -434,7 +465,23 @@ func (m *Manager) DelayProxy(ctx context.Context, name, testURL string, timeoutM
 	if m.controller == nil {
 		return 0, protocol.APIError{Code: protocol.CodeInvalidState, Message: "mihomo controller is unavailable"}
 	}
-	return m.controller.DelayProxy(ctx, name, testURL, timeoutMilliseconds)
+	global, err := m.controller.Proxies(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("read global proxies for delay: %w", err)
+	}
+	if _, exists := global.Proxies[name]; exists {
+		return m.controller.DelayProxy(ctx, name, testURL, timeoutMilliseconds)
+	}
+	providers, err := m.proxyProviders(ctx)
+	if err != nil {
+		return 0, err
+	}
+	_, _, sources := resolveProxyCatalog(global, providers)
+	provider, found := sources[name]
+	if !found {
+		return 0, protocol.APIError{Code: protocol.CodeUpstreamFailure, Message: "Proxy node was not found"}
+	}
+	return m.controller.(proxyProviderController).DelayProviderProxy(ctx, provider, name, testURL, timeoutMilliseconds)
 }
 
 func (m *Manager) Connections(ctx context.Context) (mihomo.Connections, error) {
@@ -676,6 +723,26 @@ func (m *Manager) Restart(ctx context.Context, operation Operation) error {
 
 func (m *Manager) SelectProxy(ctx context.Context, operation Operation, group, name string) error {
 	_, err := m.doOperation(ctx, "select:"+operation.ID, func(ctx context.Context) (any, error) {
+		if group == "GLOBAL" {
+			if name == "" {
+				return nil, routingArgument("GLOBAL selection is empty")
+			}
+			if err := m.lockMutation(ctx); err != nil {
+				return nil, err
+			}
+			defer m.unlock()
+			if err := m.checkIfRevision(operation.IfRevision); err != nil {
+				return nil, err
+			}
+			_, changed, err := m.changeRoutingLocked(ctx, m.settingsSnapshot().RoutingMode(), name, false, m.routingCoreStopped())
+			if err != nil {
+				m.markRoutingDegraded(ctx, err)
+			}
+			if err == nil && changed {
+				_, err = m.updateStateLocked(context.WithoutCancel(ctx), state.CommandMeta{ID: operation.ID, Source: operation.Source}, func(s state.Snapshot) (state.Snapshot, error) { return s, nil })
+			}
+			return nil, err
+		}
 		if m.controller == nil {
 			return nil, protocol.APIError{Code: protocol.CodeInvalidState, Message: "mihomo controller is unavailable"}
 		}

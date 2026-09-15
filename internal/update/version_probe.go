@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -28,6 +29,10 @@ type ExecVersionRunner struct{}
 
 // RunVersion runs self version in an isolated temporary environment.
 func (ExecVersionRunner) RunVersion(ctx context.Context, executable, dir string) ([]byte, error) {
+	return runVersionProbe(ctx, executable, dir, (*exec.Cmd).Run)
+}
+
+func runVersionProbe(ctx context.Context, executable, dir string, run func(*exec.Cmd) error) ([]byte, error) {
 	if !filepath.IsAbs(executable) || !filepath.IsAbs(dir) {
 		return nil, os.ErrInvalid
 	}
@@ -56,7 +61,7 @@ func (ExecVersionRunner) RunVersion(ctx context.Context, executable, dir string)
 	cmd.Stderr = stderr
 	// Bound inherited pipes too, then Wait reaps the child before returning.
 	cmd.WaitDelay = 100 * time.Millisecond
-	err := cmd.Run()
+	err := run(cmd)
 	if stdout.overflow || stderr.overflow {
 		return nil, errors.Join(errVersionProbeLimit, err)
 	}
@@ -64,7 +69,7 @@ func (ExecVersionRunner) RunVersion(ctx context.Context, executable, dir string)
 		return nil, ctx.Err()
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("version query stdout=%s stderr=%s: %w", stdout.buf.Bytes(), stderr.buf.Bytes(), err)
 	}
 	return stdout.buf.Bytes(), nil
 }
@@ -89,6 +94,10 @@ func ObserveReplacementTarget(ctx context.Context, role, path string, runner Ver
 	return observeReplacementTarget(ctx, role, path, runner, platform.ObserveReplacementFile)
 }
 func observeReplacementTarget(ctx context.Context, role, path string, runner VersionRunner, observe func(context.Context, string) (platform.ReplacementFile, error)) (out ReplacementTarget, err error) {
+	return observeReplacementTargetWithFallback(ctx, role, path, runner, observe, observeUserReplacementTarget)
+}
+
+func observeReplacementTargetWithFallback(ctx context.Context, role, path string, runner VersionRunner, observe func(context.Context, string) (platform.ReplacementFile, error), userProbe func(context.Context, ReplacementTarget) (ReplacementTarget, error)) (out ReplacementTarget, err error) {
 	if err = ctx.Err(); err != nil {
 		return out, err
 	}
@@ -97,7 +106,13 @@ func observeReplacementTarget(ctx context.Context, role, path string, runner Ver
 		return out, err
 	}
 	out = ReplacementTarget{Roles: []string{role}, Path: before.Path, FileID: before.FileID, SHA256: before.SHA256, Exists: before.Exists}
-	if !before.Exists || !before.MayExecute {
+	if !before.Exists {
+		return out, nil
+	}
+	if !before.MayExecute {
+		if runner == nil {
+			return userProbe(ctx, out)
+		}
 		return out, nil
 	}
 	dir, err := os.MkdirTemp("", "mihari-version-")
@@ -111,6 +126,7 @@ func observeReplacementTarget(ctx context.Context, role, path string, runner Ver
 		runner = ExecVersionRunner{}
 	}
 	raw, queryErr := runner.RunVersion(probeCtx, before.Path, dir)
+	out.probeErr = queryErr
 	if ctx.Err() != nil {
 		return ReplacementTarget{}, ctx.Err()
 	}
@@ -122,12 +138,22 @@ func observeReplacementTarget(ctx context.Context, role, path string, runner Ver
 		return ReplacementTarget{}, replacementChanged()
 	}
 	if queryErr == nil {
-		out.Version = decodeProbedVersion(raw)
+		label := decodeVersionLabel(raw)
+		out.Version = normalizedReplacementVersion(label)
+		if out.Version == "" {
+			out.UnrecognizedVersion = safeUnrecognizedVersion(label)
+		}
 	}
 	return out, nil
 }
 
 func decodeProbedVersion(raw []byte) string {
+	return normalizedReplacementVersion(decodeVersionLabel(raw))
+}
+
+// decodeVersionLabel accepts only the version field of a single strict envelope.
+// The result must be classified and filtered before it is retained or displayed.
+func decodeVersionLabel(raw []byte) string {
 	if len(raw) > versionProbeLimit {
 		return ""
 	}
@@ -171,5 +197,5 @@ func decodeProbedVersion(raw []byte) string {
 	if schema != "mihari/v1" || !seen["version"] {
 		return ""
 	}
-	return normalizedReplacementVersion(version)
+	return version
 }

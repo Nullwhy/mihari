@@ -22,6 +22,7 @@ const (
 	ModeSearch    = "search"
 	ModeDetail    = "detail"
 	ModeColumns   = "columns"
+	ModeRouting   = "routing"
 	ModeForm      = "form"
 	ModePortsEdit = "ports-edit"
 	// ModeLoggingEdit identifies numeric Logging settings text input.
@@ -30,6 +31,15 @@ const (
 	ModeExportLogs = "export-logs"
 	ModeConfirm    = "confirm"
 	ModeSetup      = "setup"
+	// ModeSubscriptionInput identifies an editable subscription form field.
+	ModeSubscriptionInput = "subscription-input"
+	// ModeSubscriptionSubmit identifies the subscription form Save control.
+	ModeSubscriptionSubmit  = "subscription-submit"
+	ModeSubscriptionCycle   = "subscription-cycle"
+	ModeSubscriptionSaving  = "subscription-saving"
+	ModeSubscriptionUnknown = "subscription-unknown"
+	ModeSubscriptionWaiting = "subscription-waiting"
+	ModeSubscriptionConfirm = "subscription-confirm"
 )
 
 // KeyBinding is one shortcut in a page or mode. Identity is (Scope, Page, Mode, Keys),
@@ -53,6 +63,9 @@ type FooterOpt struct {
 // the same physical key may appear more than once with different labels.
 func Catalog() []KeyBinding {
 	return []KeyBinding{
+		{Keys: []string{"up", "down"}, Display: "↑/↓", Label: "select a routing mode", Footer: "↑/↓ select", Scope: ScopeMode, Mode: ModeRouting},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "apply the selected mode", Footer: "Enter apply", Scope: ScopeMode, Mode: ModeRouting},
+		{Keys: []string{"esc"}, Display: "Esc", Label: "cancel mode selection", Footer: "Esc cancel", Scope: ScopeMode, Mode: ModeRouting},
 		{Keys: []string{"1", "2", "3", "4", "5", "6", "7", "8"}, Display: "1–8", Label: "jump to a rail page outside text input", Scope: ScopeGlobal},
 		{Keys: []string{"?"}, Display: "?", Label: "this help", Footer: "? help", Scope: ScopeGlobal},
 		{Keys: []string{"q"}, Display: "q", Label: "quit outside text input", Footer: "q quit", Scope: ScopeGlobal},
@@ -64,10 +77,10 @@ func Catalog() []KeyBinding {
 
 		{Keys: []string{"esc"}, Display: "Esc", Label: "return to the rail", Scope: ScopePage, Page: PageOverview},
 
-		{Keys: []string{"enter"}, Display: "Enter", Label: "expand a group or select a node", Footer: "Enter expand", Scope: ScopePage, Page: PageProxies},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "change Mode, open GLOBAL, expand a group, select a node, or Locate the current selection", Footer: "Enter expand", Scope: ScopePage, Page: PageProxies},
 		{Keys: []string{"t"}, Display: "t", Label: "test the focused node", Footer: "t test", Scope: ScopePage, Page: PageProxies},
 		{Keys: []string{"ctrl+t"}, Display: "Ctrl+T", Label: "test all", Footer: "Ctrl+T test all", Scope: ScopePage, Page: PageProxies},
-		{Keys: []string{"up", "down", "left", "right"}, Display: "↑/↓/←/→", Label: "move", Scope: ScopePage, Page: PageProxies},
+		{Keys: []string{"up", "down", "left", "right"}, Display: "↑/↓/←/→", Label: "move; at a group header, → focuses Locate and ← returns to the header", Scope: ScopePage, Page: PageProxies},
 
 		{Keys: []string{"/"}, Display: "/", Label: "search", Footer: "/ search", Scope: ScopePage, Page: PageConnections},
 		{Keys: []string{"x"}, Display: "x", Label: "close the focused connection", Footer: "x close", Scope: ScopePage, Page: PageConnections},
@@ -94,9 +107,8 @@ func Catalog() []KeyBinding {
 
 		{Keys: []string{"enter"}, Display: "Enter", Label: "details", Footer: "Enter details", Scope: ScopePage, Page: PageSubscriptions},
 		{Keys: []string{"a"}, Display: "a", Label: "add", Footer: "a add", Scope: ScopePage, Page: PageSubscriptions},
-		{Keys: []string{"e"}, Display: "e", Label: "edit", Footer: "e edit", Scope: ScopePage, Page: PageSubscriptions},
 		{Keys: []string{"space"}, Display: "Space", Label: "enable or disable", Footer: "Space toggle", Scope: ScopePage, Page: PageSubscriptions},
-		{Keys: []string{"p"}, Display: "p", Label: "cycle proxy mode", Footer: "p proxy", Scope: ScopePage, Page: PageSubscriptions},
+		{Keys: []string{"p"}, Display: "p", Label: "cycle mode", Footer: "p mode", Scope: ScopePage, Page: PageSubscriptions},
 		{Keys: []string{"r"}, Display: "r", Label: "refresh", Footer: "r refresh", Scope: ScopePage, Page: PageSubscriptions},
 		{Keys: []string{"ctrl+r"}, Display: "Ctrl+R", Label: "refresh all", Footer: "Ctrl+R refresh all", Scope: ScopePage, Page: PageSubscriptions},
 		{Keys: []string{"u"}, Display: "u", Label: "activate", Footer: "u use", Scope: ScopePage, Page: PageSubscriptions},
@@ -132,6 +144,28 @@ func Catalog() []KeyBinding {
 		{Keys: []string{"tab", "shift+tab"}, Display: "Tab / Shift+Tab", Label: "move between fields", Footer: "Tab/Shift+Tab fields", Scope: ScopeMode, Mode: ModeForm},
 		{Keys: []string{"enter"}, Display: "Enter", Label: "next or save", Footer: "Enter next/save", Scope: ScopeMode, Mode: ModeForm},
 		{Keys: []string{"esc"}, Display: "Esc", Label: "cancel", Footer: "Esc cancel", Scope: ScopeMode, Mode: ModeForm},
+		{Display: "Wait", Label: "Saving... No form input is accepted.", Footer: "Saving...", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionSaving},
+		{Keys: []string{"tab", "shift+tab", "up", "down"}, Display: "Tab/Shift+Tab/↑/↓", Label: "move between fields", Footer: "Tab/↑/↓ fields", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionInput},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "next field", Footer: "Enter next", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionInput},
+		{Keys: []string{"pgup", "pgdown"}, Display: "PgUp/PgDn", Label: "scroll details", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionInput},
+		{Keys: []string{"esc"}, Display: "Esc", Label: "cancel", Footer: "Esc cancel", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionInput},
+		{Keys: []string{"tab", "shift+tab", "up", "down"}, Display: "Tab/Shift+Tab/↑/↓", Label: "move between fields", Footer: "Tab/↑/↓ fields", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionSubmit},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "save changes", Footer: "Enter save", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionSubmit},
+		{Keys: []string{"pgup", "pgdown"}, Display: "PgUp/PgDn", Label: "scroll details", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionSubmit},
+		{Keys: []string{"esc"}, Display: "Esc", Label: "cancel", Footer: "Esc cancel", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionSubmit},
+		{Keys: []string{"up", "down"}, Display: "↑/↓", Label: "move between fields", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeForm},
+		{Keys: []string{"pgup", "pgdown"}, Display: "PgUp/PgDn", Label: "scroll details", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeForm},
+		{Keys: []string{"left", "right", "space"}, Display: "←/→/Space", Label: "cycle draft value", Footer: "←/→/Space cycle", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionCycle},
+		{Keys: []string{"pgup", "pgdown"}, Display: "PgUp/PgDn", Label: "scroll details", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionCycle},
+		{Keys: []string{"tab", "shift+tab", "up", "down"}, Display: "Tab/↑/↓", Label: "move between fields", Footer: "Tab/↑/↓ fields", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionCycle},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "next field", Footer: "Enter next", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionCycle},
+		{Keys: []string{"esc"}, Display: "Esc", Label: "cancel", Footer: "Esc cancel", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionCycle},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "confirm before submitting again", Footer: "Enter submit again", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionUnknown},
+		{Keys: []string{"esc"}, Display: "Esc", Label: "close; does not cancel the save", Footer: "Esc close", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionUnknown},
+		{Keys: []string{"esc"}, Display: "Esc", Label: "close; does not cancel the save", Footer: "Esc close (does not cancel the save)", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionWaiting},
+		{Keys: []string{"left", "right", "tab"}, Display: "←/→/Tab", Label: "choose; Cancel is selected by default", Footer: "←/→ choose", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionConfirm},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "confirm selection", Footer: "Enter confirm", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionConfirm},
+		{Keys: []string{"esc"}, Display: "Esc", Label: "cancel", Footer: "Esc cancel", Scope: ScopeMode, Page: PageSubscriptions, Mode: ModeSubscriptionConfirm},
 
 		{Display: "type", Label: "edit the address", Footer: "Type address", Scope: ScopeMode, Mode: ModePortsEdit},
 		{Keys: []string{"enter"}, Display: "Enter", Label: "apply", Footer: "Enter apply", Scope: ScopeMode, Mode: ModePortsEdit},
@@ -210,12 +244,14 @@ func RenderFooter(page PageID, mode string, opt FooterOpt) string {
 	helpQuit := helpQuitTokens()
 	escBack := globalFooterToken("Esc")
 	switch mode {
+	case ModeSubscriptionInput, ModeSubscriptionSubmit, ModeSubscriptionSaving, ModeSubscriptionCycle, ModeSubscriptionUnknown, ModeSubscriptionWaiting, ModeSubscriptionConfirm:
+		return joinFooter(footerTokens(func(b KeyBinding) bool { return b.Mode == mode }))
 	case ModeSearch:
 		tokens := footerTokens(func(b KeyBinding) bool {
 			return b.Mode == mode && (b.Page == "" || b.Page == page)
 		})
 		return joinFooter(tokens)
-	case ModeDetail, ModeColumns, ModePortsEdit:
+	case ModeDetail, ModeColumns, ModePortsEdit, ModeRouting:
 		tokens := footerTokens(func(b KeyBinding) bool {
 			return b.Mode == mode && (b.Page == "" || b.Page == page)
 		})
@@ -300,7 +336,10 @@ func RenderHelp(active PageID, mode string) string {
 		}
 	}
 
-	write("Global", filter(cat, func(x KeyBinding) bool { return x.Scope == ScopeGlobal }))
+	subscriptionOverlay := active == PageSubscriptions && (mode == ModeForm || strings.HasPrefix(mode, "subscription-"))
+	write("Global", filter(cat, func(x KeyBinding) bool {
+		return x.Scope == ScopeGlobal && (!subscriptionOverlay || x.Display == "Ctrl+C")
+	}))
 
 	if mode != "" && mode != ModeSetup {
 		write("This mode · "+modeTitle(mode), filter(cat, func(x KeyBinding) bool {
@@ -311,15 +350,20 @@ func RenderHelp(active PageID, mode string) string {
 		}))
 	}
 
-	write("This page · "+PageLabel(active), filter(cat, func(x KeyBinding) bool {
-		return x.Scope == ScopePage && x.Page == active && x.Mode == ""
-	}))
+	if !subscriptionOverlay {
+		write("This page · "+PageLabel(active), filter(cat, func(x KeyBinding) bool {
+			return x.Scope == ScopePage && x.Page == active && x.Mode == ""
+		}))
+	}
 
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// modeTitle supplies the heading for a contextual shortcut group.
 func modeTitle(mode string) string {
 	switch mode {
+	case ModeRouting:
+		return "Routing Mode"
 	case ModeSearch:
 		return "Search"
 	case ModeDetail:
@@ -328,6 +372,20 @@ func modeTitle(mode string) string {
 		return "Columns"
 	case ModeForm:
 		return "Form"
+	case ModeSubscriptionInput:
+		return "Subscription field"
+	case ModeSubscriptionSubmit:
+		return "Save changes"
+	case ModeSubscriptionCycle:
+		return "Cycle field"
+	case ModeSubscriptionSaving:
+		return "Saving"
+	case ModeSubscriptionUnknown:
+		return "Save outcome unknown"
+	case ModeSubscriptionWaiting:
+		return "Checking save"
+	case ModeSubscriptionConfirm:
+		return "Confirm save"
 	case ModePortsEdit:
 		return "Ports edit"
 	case ModeLoggingEdit:

@@ -13,6 +13,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mihari-proxy/mihari/internal/control/protocol"
 	"github.com/mihari-proxy/mihari/internal/tui/ui"
 )
@@ -41,34 +42,44 @@ const (
 type DelayState struct {
 	Kind         DelayKind
 	Milliseconds uint16
+	TestedAt     time.Time
 }
 
 type Model struct {
-	client         Client
-	newOperationID func() string
-	groups         []protocol.ProxyGroup
-	expanded       map[string]bool
-	focus          FocusID
-	delays         map[string]DelayState
-	queue          []string
-	inFlight       map[string]uint64
-	delayTestGen   uint64
-	pending        map[FocusID]bool
-	lastError      string
-	contentFocused bool
-	width          int
-	height         int
-	scrollY        int // top visible content line (viewport origin)
-	theme          ui.Theme
-	now            time.Time // delay-test spinner clock
-	delaySpinning  bool
-	delaySpinGen   uint64
+	routing            routingUI
+	groupsRevision     *uint64
+	groupsSubscription string
+	groupsFresh        bool
+	client             Client
+	newOperationID     func() string
+	groups             []protocol.ProxyGroup
+	expanded           map[string]bool
+	focus              FocusID
+	delays             map[string]DelayState
+	queue              []string
+	inFlight           map[string]uint64
+	delayTestGen       uint64
+	pending            map[FocusID]bool
+	lastError          string
+	loadError          string
+	lastSuccess        time.Time
+	contentFocused     bool
+	width              int
+	height             int
+	scrollY            int // top visible content line (viewport origin)
+	theme              ui.Theme
+	now                time.Time // delay-test spinner clock
+	delaySpinning      bool
+	delaySpinGen       uint64
 }
 
 type selectionResultMsg struct {
-	group string
-	node  string
-	err   error
+	group        string
+	node         string
+	err          error
+	routing      bool
+	epoch        uint64
+	subscription string
 }
 
 // Err implements the shell's action-outcome contract so proxy selections are
@@ -115,7 +126,14 @@ func (m *Model) SetSize(width, height int) {
 	m.ensureFocusVisible()
 }
 
+// FocusFirst resets stale focus before selecting the page's first available control.
 func (m *Model) FocusFirst() {
+	m.focus = FocusID{}
+	if m.routing.available {
+		m.routing.focus = 0
+		m.scrollY = 0
+		return
+	}
 	if len(m.groups) > 0 {
 		m.focus = FocusID{Group: m.groups[0].Name}
 	}
@@ -124,10 +142,25 @@ func (m *Model) FocusFirst() {
 }
 
 func (m *Model) SetGroups(groups protocol.ProxyGroups) {
+	m.loadError = ""
+	m.groupsFresh = true
+	m.groupsRevision = nil
+	if groups.Revision != nil {
+		revision := *groups.Revision
+		m.groupsRevision = &revision
+	}
+	m.groupsSubscription = groups.SubscriptionID
 	m.groups = append([]protocol.ProxyGroup(nil), groups.Groups...)
 	for index := range m.groups {
 		m.groups[index].All = append([]string(nil), groups.Groups[index].All...)
-		m.groups[index].Nodes = append([]protocol.ProxyNode(nil), groups.Groups[index].Nodes...)
+		m.groups[index].Nodes = nil
+		seen := make(map[string]bool)
+		for _, node := range groups.Groups[index].Nodes {
+			if !seen[node.Name] {
+				m.groups[index].Nodes = append(m.groups[index].Nodes, node)
+				seen[node.Name] = true
+			}
+		}
 	}
 	if m.groupIndex(m.focus.Group) < 0 {
 		m.FocusFirst()
@@ -142,15 +175,30 @@ func (m *Model) SetGroups(groups protocol.ProxyGroups) {
 	m.ensureFocusVisible()
 }
 
+// Update applies page results and keyboard events, including local-only Locate navigation.
 func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 	switch typed := message.(type) {
+	case routingResultMsg:
+		m.routingResult(typed)
+		return m, nil
 	case selectionResultMsg:
+		if typed.routing && (!m.routing.available || typed.epoch != m.routing.epoch || typed.subscription != m.routing.status.SubscriptionID) {
+			return m, nil
+		}
 		delete(m.pending, FocusID{Group: typed.group, Node: typed.node})
+		if typed.routing {
+			m.InvalidateGroups()
+		}
 		if typed.err != nil {
 			m.lastError = ui.ProxySelectFailed
 			return m, nil
 		}
 		m.lastError = ""
+		if typed.routing {
+			// The next authoritative snapshot owns selection display. A later
+			// panel change may already have superseded this completed request.
+			return m, nil
+		}
 		if index := m.groupIndex(typed.group); index >= 0 {
 			m.groups[index].Now = typed.node
 		}
@@ -158,7 +206,7 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 	case delayResultMsg:
 		delete(m.inFlight, typed.node)
 		if typed.err == nil {
-			m.delays[typed.node] = DelayState{Kind: DelayValue, Milliseconds: typed.delay}
+			m.delays[typed.node] = DelayState{Kind: DelayValue, Milliseconds: typed.delay, TestedAt: time.Now()}
 		} else {
 			m.delays[typed.node] = DelayState{Kind: classifyDelayError(typed.err)}
 		}
@@ -190,6 +238,9 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
+	if handled, cmd := m.routingKey(key.String()); handled {
+		return m, cmd
+	}
 	if key.String() == "ctrl+t" {
 		return m, m.testAll()
 	}
@@ -200,8 +251,17 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 	if m.focus.Node == "" {
 		switch key.String() {
 		case "enter":
-			m.expanded[m.focus.Group] = !m.expanded[m.focus.Group]
-			m.ensureFocusVisible()
+			if m.focus.Locate {
+				m.locateCurrent()
+			} else if m.groupIndex(m.focus.Group) >= 0 {
+				m.expanded[m.focus.Group] = !m.expanded[m.focus.Group]
+				m.ensureFocusVisible()
+			}
+		case "left", "right":
+			if m.groupIndex(m.focus.Group) >= 0 {
+				m.focus.Locate = key.String() == "right"
+				m.ensureFocusVisible()
+			}
 		case "up", "down":
 			m.move(key.String())
 		}
@@ -219,48 +279,66 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 }
 
 func (m *Model) View() string {
+	if m.routing.open {
+		return m.routingView()
+	}
+	header := m.routingHeader()
 	if len(m.groups) == 0 {
+		if m.loadError != "" && !m.lastSuccess.IsZero() {
+			lines, _, _ := m.buildContent(false)
+			return strings.Join(append(header, lines...), "\n")
+		}
 		inner := ui.FullSectionInner(m.width)
 		body := m.theme.Muted.Render(ui.NoProxyGroups)
-		return ui.RenderBorderedSection(m.theme, ui.ProxiesSectionTitle, body, inner)
+		if m.loadError != "" {
+			body = m.theme.Danger.Render("Unable to load proxy groups") + "\n" + m.loadError + "\n" + m.theme.Muted.Render("Waiting for automatic retry")
+		}
+		return strings.Join(append(header, ui.RenderBorderedSection(m.theme, ui.ProxiesSectionTitle, ansi.Wrap(body, ui.SectionTextWidth(inner), ""), inner)), "\n")
 	}
-	lines, _, _ := m.buildContent()
-	return strings.Join(ui.SliceLines(lines, m.scrollY, m.height), "\n")
+	lines, _, _ := m.buildContent(false)
+	height := m.height
+	if height > 0 {
+		height = max(1, height-len(header))
+	}
+	return strings.Join(append(header, ui.SliceLines(lines, m.scrollY, height)...), "\n")
 }
 
 // buildContent renders the full page as terminal lines and reports the inclusive
 // line range of the keyboard focus target (end exclusive). Each proxy group is
 // a bordered section; expanded node cards sit inside the parent section body.
-func (m *Model) buildContent() (lines []string, focusStart, focusEnd int) {
+// focusWholeGroup includes all candidates and the bottom border for explicit jumps.
+func (m *Model) buildContent(focusWholeGroup bool) (lines []string, focusStart, focusEnd int) {
 	focusStart, focusEnd = -1, -1
+	if m.loadError != "" {
+		body := "Refresh failed\n" + m.loadError + "\nShowing last available data. Retrying automatically."
+		if !m.lastSuccess.IsZero() {
+			body = "Last updated " + m.lastSuccess.Local().Format("15:04:05") + fmt.Sprintf(" · %ds ago\n", max(0, int(time.Since(m.lastSuccess).Seconds()))) + body
+		}
+		inner := ui.FullSectionInner(m.width)
+		section := ui.RenderBorderedSection(m.theme, "Stale data", ansi.Wrap(body, ui.SectionTextWidth(inner), ""), inner)
+		lines = append(lines, strings.Split(m.theme.Warning.Render(section), "\n")...)
+	}
 	if m.lastError != "" {
 		lines = append(lines, m.theme.Danger.Render(m.lastError))
 	}
 	inner := ui.FullSectionInner(m.width)
 	textW := ui.SectionTextWidth(inner)
 	for _, group := range m.groups {
-		marker := "▸"
-		if m.expanded[group.Name] {
-			marker = "▾"
-		}
-		focus := "  "
-		groupFocused := m.focus == (FocusID{Group: group.Name})
-		if groupFocused {
-			focus = ui.FocusMarker
-		}
-		nowName := ui.DisplayProxyName(group.Now)
-		nowDisplay := ui.MissingValue
-		if nowName != "" {
-			// The current node is the live selection → Positive.
-			nowDisplay = m.theme.Success.Render(nowName)
-		}
-		header := fmt.Sprintf("%s%s  Now: %s", focus, marker, nowDisplay)
-		switch {
-		case groupFocused && m.contentFocused:
-			header = ui.ApplyFocusStyle(header, m.theme.RowFocus)
-		}
+		groupFocused := m.focus.Group == group.Name && m.focus.Node == "" && (!m.routing.available || m.routing.focus < 0)
+		header := m.renderGroupHeader(group, textW, groupFocused)
 
 		bodyLines := []string{header}
+		if m.loadError != "" {
+			var tested time.Time
+			for _, node := range group.Nodes {
+				if stamp := m.delays[node.Name].TestedAt; stamp.After(tested) {
+					tested = stamp
+				}
+			}
+			if !tested.IsZero() {
+				bodyLines = append(bodyLines, m.theme.Muted.Render("Last tested "+tested.Local().Format("15:04:05")))
+			}
+		}
 		// Body-relative line of the group header (0). After section wrap, this
 		// maps to sectionLines[1] (after the top border).
 		groupBodyLine := 0
@@ -303,6 +381,9 @@ func (m *Model) buildContent() (lines []string, focusStart, focusEnd int) {
 		if groupFocused {
 			focusStart = sectionBase
 			focusEnd = bodyOffset + groupBodyLine + 1
+			if focusWholeGroup {
+				focusEnd = len(lines)
+			}
 		}
 		if nodeFocusBodyStart >= 0 {
 			focusStart = bodyOffset + nodeFocusBodyStart
@@ -317,19 +398,20 @@ func (m *Model) ensureFocusVisible() {
 	if m.height <= 0 || len(m.groups) == 0 {
 		return
 	}
-	lines, focusStart, focusEnd := m.buildContent()
-	m.scrollY = ui.EnsureLineVisible(m.scrollY, m.height, len(lines), focusStart, focusEnd)
+	lines, focusStart, focusEnd := m.buildContent(false)
+	m.scrollY = ui.EnsureLineVisible(m.scrollY, max(1, m.height-len(m.routingHeader())), len(lines), focusStart, focusEnd)
 }
 
+// renderNode renders selection, keyboard focus, and pending state independently within a fixed-size proxy card.
 func (m *Model) renderNode(group protocol.ProxyGroup, node protocol.ProxyNode, width int) string {
 	id := FocusID{Group: group.Name, Node: node.Name}
 	focus := "  "
-	if m.focus == id {
+	if m.focus == id && (!m.routing.available || m.routing.focus < 0) {
 		focus = ui.FocusMarker
 	}
 	selected := " "
 	if group.Now == node.Name {
-		selected = "✓"
+		selected = m.theme.Info.Render("●")
 	}
 	if m.pending[id] {
 		selected = "…"
@@ -346,12 +428,12 @@ func (m *Model) renderNode(group protocol.ProxyGroup, node protocol.ProxyNode, w
 	// Network/protocol metadata shares the TCP/UDP network styling.
 	metadata = ui.StyleNetwork(m.theme, metadata)
 	// Truncate long names to the card's inner width so the card stays a stable
-	// two lines (design P3): width − border 2 − padding 2 − marker/✓ 2.
+	// two lines (design P3): width − border 2 − padding 2 − marker/selection 2.
 	name := ui.TruncateVisible(ui.DisplayProxyName(node.Name), max(4, width-7))
 	content := fmt.Sprintf("%s%s %s\n%s  %s", focus, selected, name, metadata, renderDelay(m.theme, m.delays[node.Name], m.now))
 	style := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1).Width(width)
 	// Accent the focused node only while content owns keyboard focus.
-	if m.focus == id && m.contentFocused {
+	if m.focus == id && m.contentFocused && (!m.routing.available || m.routing.focus < 0) {
 		style = style.BorderForeground(m.theme.ColorAccent)
 	}
 	return style.Render(content)
@@ -372,15 +454,34 @@ func (m *Model) selectFocused() tea.Cmd {
 	if m.client == nil || m.focus.Node == "" {
 		return nil
 	}
+	var revision *uint64
+	if m.routing.available && m.focus.Group == "GLOBAL" {
+		for id, pending := range m.pending {
+			if id.Group == "GLOBAL" && pending {
+				return nil
+			}
+		}
+		if !m.globalCandidatesCurrent() {
+			m.lastError = "GLOBAL candidates changed; wait for refresh"
+			return nil
+		}
+		value := *m.groupsRevision
+		revision = &value
+	}
 	m.lastError = ""
 	id := m.focus
 	m.pending[id] = true
 	operationID := m.newOperationID()
+	routing, epoch, subscription := revision != nil, m.routing.epoch, m.groupsSubscription
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, err := m.client.SelectProxy(ctx, id.Group, protocol.ProxySelectionRequest{OperationID: operationID, Name: id.Node})
-		return selectionResultMsg{group: id.Group, node: id.Node, err: err}
+		_, err := m.client.SelectProxy(ctx, id.Group, protocol.ProxySelectionRequest{OperationID: operationID, Name: id.Node, IfRevision: revision})
+		result := selectionResultMsg{group: id.Group, node: id.Node, err: err, routing: routing, epoch: epoch, subscription: subscription}
+		if routing {
+			return ui.PageResultMsg{Page: ui.PageProxies, Result: result}
+		}
+		return result
 	}
 }
 
@@ -561,8 +662,7 @@ func renderDelay(theme ui.Theme, delay DelayState, now time.Time) string {
 		if now.IsZero() {
 			now = time.Unix(0, 0)
 		}
-		// Braille spinner + "Testing" (not static Testing…).
-		return style.Render(ui.SpinnerLabel(now, "Testing"))
+		return style.Render(ui.SpinnerFrame(now, delaySpinInterval))
 	case DelayValue:
 		return style.Render(fmt.Sprintf("%d ms", delay.Milliseconds))
 	case DelayTimeout:
