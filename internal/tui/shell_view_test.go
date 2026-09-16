@@ -138,7 +138,6 @@ func TestShellView_StaleUsesRightStatusNotSpinner(t *testing.T) {
 }
 
 func TestShellView_StaleFooterShowsLastObserved(t *testing.T) {
-	freezeUTC(t)
 	model := NewModel()
 	model.width, model.height = 100, 28
 	model.resizePages()
@@ -264,4 +263,18 @@ func nonEmptyLines(view string) []string {
 		}
 	}
 	return out
+}
+
+func TestShellFooter_DegradedErrorEscapesControlsWithoutChangingStatus(t *testing.T) {
+	model := NewModel()
+	model.connected = true
+	original := "token=fixture-original\x1b[31m\x00\nsecond line"
+	model.status = protocol.Status{Health: "degraded", LastError: original}
+	got := model.footerGlobalSegment()
+	if strings.ContainsAny(got, "\x1b\x00\n") || !strings.Contains(got, `token=fixture-original\x1b[31m\x00`) || !strings.Contains(got, "second line") {
+		t.Fatalf("unsafe or incomplete degraded footer: %q", got)
+	}
+	if model.status.LastError != original {
+		t.Fatal("display escaping changed the original status error")
+	}
 }
