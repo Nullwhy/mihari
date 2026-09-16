@@ -9,6 +9,7 @@ import (
 	"github.com/mihari-proxy/mihari/internal/tui/ui"
 )
 
+// View renders the connection list or its active detail/column overlay.
 func (m *Model) View() string {
 	controlFocused := m.contentFocused && m.focus.kind == focusControl
 	activeN, closedN := len(m.history.Active()), len(m.history.Closed())
@@ -51,7 +52,7 @@ func (m *Model) View() string {
 		return m.columnsView()
 	}
 	if m.detail != nil {
-		return m.detail.View(m.width, m.height)
+		return m.detail.View(max(0, m.width-m.theme.Content.GetHorizontalPadding()), m.height)
 	}
 	return base
 }

@@ -421,6 +421,7 @@ func TestConnections_SearchDirectTypeNoEnter(t *testing.T) {
 	}
 }
 
+// TestModel_DetailLooksUpOnlyPublicDestinationAddresses excludes local source addresses.
 func TestModel_DetailLooksUpOnlyPublicDestinationAddresses(t *testing.T) {
 	client := &fakeConnectionsClient{geoIPResult: protocol.GeoIPLookupResult{Records: []protocol.GeoIPRecord{
 		{Address: "1.1.1.1", CountryCode: "AU", ASN: 13335, Organization: "Cloudflare, Inc."},
@@ -444,13 +445,14 @@ func TestModel_DetailLooksUpOnlyPublicDestinationAddresses(t *testing.T) {
 		t.Fatalf("addresses=%q", got)
 	}
 	view := model.View()
-	for _, want := range []string{"GeoIP", "AU", "AS13335", "Cloudflare, Inc.", "Basic"} {
+	for _, want := range []string{"GeoIP", "AU", "AS13335", "Cloudflare, Inc.", "ENDPOINTS"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("view missing %q: %s", want, view)
 		}
 	}
 }
 
+// TestModel_GeoIPFailureDegradesOnlyGeoIPCard keeps connection fields available on lookup failure.
 func TestModel_GeoIPFailureDegradesOnlyGeoIPCard(t *testing.T) {
 	client := &fakeConnectionsClient{geoIPErr: errors.New("database unavailable")}
 	model := New(client, nil)
@@ -462,7 +464,7 @@ func TestModel_GeoIPFailureDegradesOnlyGeoIPCard(t *testing.T) {
 	_, command := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model.Update(command())
 	view := model.View()
-	if !strings.Contains(view, "GeoIP") || !strings.Contains(view, "Unavailable") || !strings.Contains(view, "Basic") {
+	if !strings.Contains(view, "GeoIP") || !strings.Contains(view, "Unavailable") || !strings.Contains(view, "ENDPOINTS") {
 		t.Fatalf("view=%s", view)
 	}
 }

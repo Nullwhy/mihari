@@ -329,6 +329,7 @@ func TestRenderHelp_IncludesGlobalJumpAndQuit(t *testing.T) {
 	}
 }
 
+// TestRenderFooter_MatchesCurrentLayout pins each page and mode's shortcut contract.
 func TestRenderFooter_MatchesCurrentLayout(t *testing.T) {
 	cases := []struct {
 		name string
@@ -347,7 +348,7 @@ func TestRenderFooter_MatchesCurrentLayout(t *testing.T) {
 		{"system", RenderFooter(PageSystem, "", FooterOpt{}), "Esc back  Enter activate  ? help  q quit"},
 		{"search", RenderFooter(PageConnections, ModeSearch, FooterOpt{}), "Type to filter  ←/→ cursor  ↑/↓ leave  Esc done"},
 		{"setup", RenderFooter(PageSetup, "", FooterOpt{}), "Tab fields  Enter continue  Esc back  Ctrl+C quit"},
-		{"detail", RenderFooter(PageConnections, ModeDetail, FooterOpt{}), "Enter/Esc close  ? help  q quit"},
+		{"detail", RenderFooter(PageConnections, ModeDetail, FooterOpt{}), "Enter/Esc close  ↑/↓ scroll  ? help  q quit"},
 		{"columns", RenderFooter(PageConnections, ModeColumns, FooterOpt{}), "↑/↓ column  Space toggle  Enter save  Esc cancel  ? help  q quit"},
 		{"form", RenderFooter(PageSubscriptions, ModeForm, FooterOpt{}), "Tab/Shift+Tab fields  Enter next/save  Esc cancel"},
 		{"ports", RenderFooter(PageSystem, ModePortsEdit, FooterOpt{}), "Type address  Enter apply  Esc cancel  ? help  q quit"},
