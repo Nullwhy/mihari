@@ -1729,13 +1729,64 @@ func TestSystemServiceActionsWorkWhileDaemonDisconnected(t *testing.T) {
 	}
 }
 
+func systemUpSinceModel(t *testing.T, status protocol.Status, core protocol.CoreStatus) *Model {
+	t.Helper()
+	model := New(&fakeClient{}, func() string { return "system-op" })
+	model.SetSnapshot(status, core)
+	model.SetMutationsEnabled(true)
+	return model
+}
+
+func TestSystemDaemonDetailsShowUpSince(t *testing.T) {
+	daemonStart := time.Date(2026, 9, 17, 14, 32, 5, 0, time.Local)
+	model := systemUpSinceModel(t,
+		protocol.Status{DaemonVersion: "v0.4.0", Health: "ok", StartedAt: daemonStart, Capabilities: []string{protocol.CapabilityOnboarding}},
+		protocol.CoreStatus{Status: "running"},
+	)
+	model.focusID = rowDaemon
+	model = updateKey(t, model, tea.KeyPressMsg{Code: tea.KeyEnter})
+	view := model.View()
+	if strings.Contains(view, "Uptime") {
+		t.Fatalf("daemon detail still shows Uptime: %s", view)
+	}
+	clock := daemonStart.Format("2006-01-02 15:04:05")
+	if !strings.Contains(view, ui.UpSinceLabel) || !strings.Contains(view, clock) || !strings.Contains(view, " · ") {
+		t.Fatalf("daemon detail missing Up Since clock: %s", view)
+	}
+}
+
+func TestSystemCoreDetailsShowUpSince(t *testing.T) {
+	coreStart := time.Date(2026, 9, 17, 15, 1, 9, 0, time.Local)
+	model := systemUpSinceModel(t,
+		protocol.Status{DaemonVersion: "v0.4.0", Health: "ok", Capabilities: []string{protocol.CapabilityOnboarding}},
+		protocol.CoreStatus{Status: "running", Version: "v1.19.0", PID: 42, Restarts: 2, StartedAt: coreStart},
+	)
+	model.focusID = rowCore
+	model = updateKey(t, model, tea.KeyPressMsg{Code: tea.KeyEnter})
+	view := model.View()
+	clock := coreStart.Format("2006-01-02 15:04:05")
+	if !strings.Contains(view, ui.UpSinceLabel) || !strings.Contains(view, clock) || !strings.Contains(view, "Restarts 2") {
+		t.Fatalf("core detail missing Up Since: %s", view)
+	}
+}
+
+func TestSystemCoreDetailsDashUpSinceWithoutProcess(t *testing.T) {
+	model := systemUpSinceModel(t, protocol.Status{}, protocol.CoreStatus{Status: "backoff", Restarts: 4})
+	model.focusID = rowCore
+	model = updateKey(t, model, tea.KeyPressMsg{Code: tea.KeyEnter})
+	view := model.View()
+	if !strings.Contains(view, "Up Since "+ui.MissingValue+" · "+ui.MissingValue) || !strings.Contains(view, "Restarts 4") {
+		t.Fatalf("core without process should dash Up Since: %s", view)
+	}
+}
+
 func TestSystemEnterInspectsRowsAndRoutesSetupToStandaloneSetup(t *testing.T) {
 	model := New(&fakeClient{}, func() string { return "system-op" })
 	model.SetSnapshot(protocol.Status{DaemonVersion: "v0.4.0", Health: "ok", StartedAt: time.Now().Add(-5 * time.Minute), Capabilities: []string{protocol.CapabilityOnboarding}}, protocol.CoreStatus{Status: "running"})
 	model.SetMutationsEnabled(true)
 	model.focusID = rowDaemon
 	model = updateKey(t, model, tea.KeyPressMsg{Code: tea.KeyEnter})
-	if !strings.Contains(model.View(), "Daemon details") || !strings.Contains(model.View(), "Uptime") {
+	if !strings.Contains(model.View(), "Daemon details") || !strings.Contains(model.View(), ui.UpSinceLabel) {
 		t.Fatalf("detail view=%s", model.View())
 	}
 	model = updateKey(t, model, tea.KeyPressMsg{Code: tea.KeyEscape})
