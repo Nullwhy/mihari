@@ -109,10 +109,15 @@ func TestWebGUIRendersCardsAndFooterWithoutSecrets(t *testing.T) {
 	if command == nil {
 		t.Fatal("capability did not enable status load")
 	}
-	updated, _ := model.Update(command())
+	updated, _ := model.Update(command().(ui.PageResultMsg).Result)
 	model = updated.(*Model)
 	view := model.View()
-	for _, want := range []string{"127.0.0.1:9191", "Zashboard", "v2.1.0", "v2.0.0", "MetaCubeXD", "8e31c4a", "3", "Loopback", "Controller isolation", "Mutation coordinator"} {
+	for _, moved := range []string{"Loopback", "Controller isolation", "Mutation coordinator"} {
+		if strings.Contains(view, moved) {
+			t.Fatalf("safeguard %q should only appear in help", moved)
+		}
+	}
+	for _, want := range []string{"127.0.0.1:9191", "Zashboard", "v2.1.0", "v2.0.0", "MetaCubeXD", "8e31c4a", "3"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("missing %q in view=%s", want, view)
 		}
@@ -124,8 +129,12 @@ func TestWebGUIRendersCardsAndFooterWithoutSecrets(t *testing.T) {
 	if strings.Contains(view, "token=") || strings.Contains(view, "super-secret") {
 		t.Fatalf("view leaked open token: %s", view)
 	}
-	if hints := model.FooterHints(); !strings.Contains(hints, "Space set default") || !strings.Contains(hints, "b rollback") ||
-		!strings.Contains(hints, "x uninstall") || !strings.Contains(hints, "r reinstall") {
+	for _, want := range []string{"Loopback", "Controller isolation", "Mutation coordinator", "Space", "rollback", "reinstall"} {
+		if !strings.Contains(model.HelpContent(), want) {
+			t.Fatalf("help missing %q", want)
+		}
+	}
+	if hints := model.FooterHints(); !strings.Contains(hints, "Tab move") || !strings.Contains(hints, "Enter activate") {
 		t.Fatalf("hints=%q", hints)
 	}
 }

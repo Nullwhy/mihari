@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/mihari-proxy/mihari/internal/config"
 	"github.com/mihari-proxy/mihari/internal/control/protocol"
@@ -97,6 +98,8 @@ type Options struct {
 	Onboarding     *onboarding.Service
 	// Logging applies daemon-owned file logging settings at runtime.
 	Logging LoggingRuntime
+	// LoggingWait injects the observation interval wait for lifecycle tests.
+	LoggingWait func(context.Context, time.Duration) error
 	// RefreshLogSecrets replaces the exact subscription URL redaction snapshot.
 	RefreshLogSecrets func(catalogURLs []string)
 	Panels            PanelService
@@ -148,6 +151,9 @@ type Manager struct {
 	routingMessage string // guarded by mutation ownership
 	trustedCore    *core.TrustedExecution
 
+	subscriptionRecoveryTimeout time.Duration
+	subscriptionTimeout         time.Duration
+
 	store                     *state.Store
 	coordinator               *state.Coordinator
 	installer                 CoreInstaller
@@ -167,6 +173,9 @@ type Manager struct {
 	onboarding                *onboarding.Service
 	onboardingRestartRequired bool
 	logging                   LoggingRuntime
+	loggingObservation        loggingObservation // guarded by mutation ownership
+	loggingUnsaved            bool               // remains set across observation failures until saved or restarted
+	loggingWait               func(context.Context, time.Duration) error
 	refreshLogSecrets         func(catalogURLs []string)
 	panels                    PanelService
 	webGateway                WebGateway
@@ -184,6 +193,7 @@ type Manager struct {
 	activationPhase           string
 	settingsMu                sync.RWMutex
 	configGeneration          uint64
+	coreEpoch                 uint64 // guarded by mutation ownership; includes startup preparation
 	tunLastError              string
 	maintenance               chan struct{}
 	subscriptionChanges       chan struct{}
@@ -197,9 +207,10 @@ type Manager struct {
 }
 
 type operationEntry struct {
-	done   chan struct{}
-	result any
-	err    error
+	done     chan struct{}
+	result   any
+	err      error
+	warnings protocol.WarningOutcome
 }
 
 func New(options Options) *Manager {
@@ -242,7 +253,9 @@ func New(options Options) *Manager {
 		settings = config.Defaults()
 	}
 	manager := &Manager{
-		trustedCore: options.TrustedCore,
+		subscriptionRecoveryTimeout: subscriptionRecoveryTimeout,
+		subscriptionTimeout:         subscriptionExecutionTimeout,
+		trustedCore:                 options.TrustedCore,
 
 		store:              store,
 		coordinator:        coordinator,
@@ -262,6 +275,7 @@ func New(options Options) *Manager {
 		prepareGeoIP:       options.PrepareGeoIP,
 		onboarding:         options.Onboarding,
 		logging:            options.Logging,
+		loggingWait:        options.LoggingWait,
 		refreshLogSecrets:  options.RefreshLogSecrets,
 		panels:             options.Panels,
 		webGateway:         options.WebGateway,
@@ -327,6 +341,12 @@ func (m *Manager) Run(ctx context.Context) error {
 			cancelScheduler()
 			<-schedulerDone
 		}()
+	}
+	if m.logging != nil && m.controller != nil {
+		loggingCtx, cancelLogging := context.WithCancel(ctx)
+		loggingDone := make(chan struct{})
+		go func() { defer close(loggingDone); m.runLoggingObserver(loggingCtx) }()
+		defer func() { cancelLogging(); <-loggingDone }()
 	}
 	shutdownObserved := make(chan struct{})
 	go func() {
@@ -413,12 +433,17 @@ func (m *Manager) Observe(observation supervisor.Observation) {
 	}
 	defer m.unlock()
 	current := m.store.Load().Core
+	if current.Status != string(observation.Status) || current.PID != observation.PID || current.Restarts != observation.Restarts || !current.StartedAt.Equal(observation.StartedAt) {
+		m.coreEpoch++
+		m.loggingObservation = loggingObservation{}
+	}
 	m.setCoreStateLocked(state.CoreState{
 		Status:      string(observation.Status),
 		PID:         observation.PID,
 		Restarts:    observation.Restarts,
 		LastError:   observation.LastError,
 		NextRetryAt: observation.NextRetryAt,
+		StartedAt:   observation.StartedAt,
 		Version:     current.Version,
 		Channel:     current.Channel,
 		AlphaSHA:    current.AlphaSHA,
@@ -845,19 +870,21 @@ func (m *Manager) doOperation(ctx context.Context, key string, execute func(cont
 	if err := m.checkOpen(); err != nil {
 		return nil, err
 	}
-	executeOnce := func() (any, error) {
+	executeOnce := func() (any, protocol.WarningOutcome, error) {
 		executionCtx, batch := newOperationDiagnostics(ctx, key)
 		result, err := execute(executionCtx)
-		m.flushDiagnostics(executionCtx, batch)
-		if err != nil && m.diagnosticReporter != nil && !diagnostics.AlreadyReported(err) {
+		warnings := m.flushDiagnostics(executionCtx, batch)
+		if err != nil && !diagnostics.AlreadyReported(err) {
 			if level, emit := diagnostics.FailureLevel(executionCtx, err); emit {
-				m.diagnosticReporter(executionCtx, diagnostics.Record{
+				err = diagnostics.ReportError(executionCtx, m.diagnosticReporter, diagnostics.Record{
 					Component: "runtime",
 					Event:     "operation.failed",
 					Level:     level,
 					Err:       err,
 				})
-				err = diagnostics.MarkReported(err)
+				if m.diagnosticReporter != nil {
+					err = diagnostics.MarkReported(err)
+				}
 			}
 		}
 		if err == nil && m.diagnosticReporter != nil && operationSuccessKey(key) {
@@ -867,17 +894,21 @@ func (m *Manager) doOperation(ctx context.Context, key string, execute func(cont
 				Level:     slog.LevelInfo,
 			})
 		}
+		return result, warnings, err
+	}
+	returnResult := func(result any, warnings protocol.WarningOutcome, err error) (any, error) {
+		diagnostics.ReturnWarnings(ctx, warnings)
 		return result, err
 	}
 	if key == "" || key[len(key)-1] == ':' {
-		return executeOnce()
+		return returnResult(executeOnce())
 	}
 	m.operationsMu.Lock()
 	if existing := m.operations[key]; existing != nil {
 		m.operationsMu.Unlock()
 		select {
 		case <-existing.done:
-			return existing.result, existing.err
+			return returnResult(existing.result, existing.warnings, existing.err)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -896,15 +927,16 @@ func (m *Manager) doOperation(ctx context.Context, key string, execute func(cont
 		}
 		if len(m.operations) >= 256 {
 			m.operationsMu.Unlock()
-			return executeOnce()
+			return returnResult(executeOnce())
 		}
 	}
 	m.operations[key] = entry
 	m.operationsMu.Unlock()
 
-	entry.result, entry.err = executeOnce()
+	result, warnings, err := executeOnce()
+	entry.result, entry.err, entry.warnings = result, err, warnings.References()
 	close(entry.done)
-	return entry.result, entry.err
+	return returnResult(result, warnings, err)
 }
 
 func (m *Manager) setCoreState(coreState state.CoreState) {

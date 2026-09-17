@@ -4,13 +4,16 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mihari-proxy/mihari/internal/diagnostics"
 )
 
 const (
+	// LevelSilent disables ordinary file records, independently of severity.
+	LevelSilent slog.Level = 100
 	// MaxCaptureLineBytes is the per-line capture cap for mihomo stdout/stderr.
 	MaxCaptureLineBytes = 256 << 10
 	// MaxExportRecordBytes is the per-record export parse cap.
@@ -52,6 +55,8 @@ func ParseLevel(level string) (slog.Level, error) {
 		return slog.LevelWarn, nil
 	case "error":
 		return slog.LevelError, nil
+	case "silent":
+		return LevelSilent, nil
 	default:
 		return 0, fmt.Errorf("unsupported logging level %q", level)
 	}
@@ -99,9 +104,7 @@ type failureReporter struct {
 	last     map[FailureClass]time.Time
 }
 
-var pathTokenPattern = regexp.MustCompile(`(?:[A-Za-z]:)?(?:[\\/][^\\/:*?"<>|\r\n]+)+`)
-
-// NewFailureReporter writes rate-limited, redacted failure lines without full paths.
+// NewFailureReporter writes bounded original failure details through an independent outlet.
 func NewFailureReporter(out io.Writer, redactor *Redactor, now func() time.Time) FailureReporter {
 	if now == nil {
 		now = time.Now
@@ -120,15 +123,13 @@ func (r *failureReporter) Report(class FailureClass, err error) {
 		return
 	}
 	r.last[class] = now
-	msg := ""
-	if err != nil {
-		msg = err.Error()
+	captured := diagnostics.Capture(err)
+	msg := diagnostics.EscapeTerminal(captured.Text)
+	// Physical records stay on one line; escapes represent the original controls.
+	msg = strings.NewReplacer("\n", `\n`, "\t", `\t`).Replace(msg)
+	if captured.Truncated {
+		msg += " [Diagnostic capture truncated: " + captured.Reason + "]"
 	}
-	if r.redactor != nil {
-		msg = r.redactor.String(msg)
-	}
-	msg = pathTokenPattern.ReplaceAllString(msg, "[path]")
-	msg = strings.NewReplacer("\r", " ", "\n", " ").Replace(msg)
 	line := "logging: " + string(class)
 	if msg != "" {
 		line += ": " + msg

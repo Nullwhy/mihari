@@ -60,6 +60,80 @@ func TestOverview_RecentOperationsShowsActionDetailAndTime(t *testing.T) {
 	}
 }
 
+func overviewLifetimeSnapshot() Snapshot {
+	return Snapshot{
+		Status:        protocol.Status{StartedAt: time.Date(2026, 9, 17, 14, 32, 0, 0, time.Local)},
+		Core:          protocol.CoreStatus{Status: "running", Version: "v1.19.0", PID: 42, Restarts: 3, StartedAt: time.Date(2026, 9, 17, 15, 1, 0, 0, time.Local)},
+		MihariVersion: "0.1.0",
+		Monitor:       ui.MonitorSnapshot{Traffic: []ui.TrafficPoint{{Up: 1, Down: 2}}, MemoryInUse: 1024},
+	}
+}
+
+func TestOverview_GeneralShowsDaemonUpSince(t *testing.T) {
+	snapshot := overviewLifetimeSnapshot()
+	model := New()
+	model.SetSize(100, 30)
+	model.SetSnapshot(snapshot)
+	view := stripANSI(model.View())
+	clock := snapshot.Status.StartedAt.Format("2006-01-02 15:04")
+	if !strings.Contains(view, ui.OverviewGeneralTitle) || !strings.Contains(view, ui.UpSinceLabel) || !strings.Contains(view, clock) {
+		t.Fatalf("general missing Up Since:\n%s", view)
+	}
+}
+
+func TestOverview_CoreLifetimeSharesRowBelowTraffic(t *testing.T) {
+	snapshot := overviewLifetimeSnapshot()
+	model := New()
+	model.SetSize(100, 30)
+	model.SetSnapshot(snapshot)
+	view := stripANSI(model.View())
+	coreClock := snapshot.Core.StartedAt.Format("2006-01-02 15:04")
+	foundSameRow := false
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, ui.UpSinceLabel) && strings.Contains(line, coreClock) && strings.Contains(line, ui.RestartsLabel) && strings.Contains(line, "3") {
+			foundSameRow = true
+			break
+		}
+	}
+	if !foundSameRow {
+		t.Fatalf("core lifetime should share one row below UL/DL:\n%s", view)
+	}
+}
+
+func TestOverview_CoreLifetimeWrapsWhenNarrow(t *testing.T) {
+	snapshot := overviewLifetimeSnapshot()
+	model := New()
+	model.SetSize(40, 30)
+	model.SetSnapshot(snapshot)
+	view := stripANSI(model.View())
+	coreClock := snapshot.Core.StartedAt.Format("2006-01-02 15:04")
+	foundWrapped := false
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, ui.UpSinceLabel) && strings.Contains(line, coreClock) && strings.Contains(line, ui.RestartsLabel) {
+			t.Fatalf("narrow core lifetime should wrap, still one line: %q\n%s", line, view)
+		}
+		if strings.Contains(line, ui.UpSinceLabel) && strings.Contains(line, coreClock) {
+			foundWrapped = true
+		}
+	}
+	if !foundWrapped || !strings.Contains(view, ui.RestartsLabel) || !strings.Contains(view, "3") {
+		t.Fatalf("narrow wrap missing fields:\n%s", view)
+	}
+}
+
+func TestOverview_MissingCoreProcessDashesUpSince(t *testing.T) {
+	model := New()
+	model.SetSize(100, 30)
+	model.SetSnapshot(Snapshot{
+		Status: protocol.Status{},
+		Core:   protocol.CoreStatus{Status: "backoff", Restarts: 1},
+	})
+	view := stripANSI(model.View())
+	if !strings.Contains(view, ui.MissingValue) || !strings.Contains(view, ui.RestartsLabel) {
+		t.Fatalf("missing process should dash Up Since and keep Restarts:\n%s", view)
+	}
+}
+
 func TestOverview_GeneralCardServiceMihariSysProxyTun(t *testing.T) {
 	live := true
 	model := New()
@@ -257,10 +331,17 @@ func TestOverview_WideLayoutUsesTwoColumnKPIGrid(t *testing.T) {
 		}
 	}
 
-	// Config state lives in the General Health row with the ok phrase; in a
-	// half-width card the long phrase wraps, so match the visible fragments.
-	if !strings.Contains(wideView, ui.OverviewHealthLabel) || !strings.Contains(wideView, "All Config Desired and") || !strings.Contains(wideView, "Applied Successfully") {
-		t.Fatalf("wide view missing Health row:\n%s", wideView)
+	// Config state lives in the General Health row. Keep the ok phrase short
+	// enough that a half-width card shows it on the same line as the label.
+	foundHealthOK := false
+	for _, line := range strings.Split(wideView, "\n") {
+		if strings.Contains(line, ui.OverviewHealthLabel) && strings.Contains(line, "All Configs Applied") {
+			foundHealthOK = true
+			break
+		}
+	}
+	if !foundHealthOK {
+		t.Fatalf("wide view missing unwrapped Health row %q:\n%s", "All Configs Applied", wideView)
 	}
 
 	// General and Core titles should share a visual row when joined horizontally.
@@ -633,4 +714,13 @@ var clockPattern = regexp.MustCompile(`\d{2}:\d{2}:\d{2}`)
 
 func looksLikeClock(plain string) bool {
 	return clockPattern.MatchString(plain)
+}
+
+func TestOverview_ConfigErrorEscapesControls(t *testing.T) {
+	model := New()
+	model.SetSize(100, 30)
+	model.SetSnapshot(Snapshot{Status: protocol.Status{Config: &protocol.ConfigStatus{LastError: "token=fixture\x1b[31m"}}})
+	if view := model.View(); !strings.Contains(view, `token=fixture\x1b[31m`) || strings.Contains(view, "fixture\x1b[31m") {
+		t.Fatalf("original controls were not escaped: %q", view)
+	}
 }

@@ -14,6 +14,9 @@ type CoreStatus struct {
 	Restarts    uint64    `json:"restarts"`
 	LastError   string    `json:"last_error,omitempty"`
 	NextRetryAt time.Time `json:"next_retry_at,omitzero"`
+	// StartedAt is when the currently supervised core process started.
+	// It is omitted when no core process is running.
+	StartedAt time.Time `json:"started_at,omitzero"`
 	// LocalReady reports whether an existing local core binary already satisfies
 	// setup without a network download (onboarding hint). Optional: omitted unless
 	// the runtime exposes local-core detection (design §4.3).
@@ -135,12 +138,14 @@ type DelayTestRequest struct {
 }
 
 type MutationResult struct {
+	WarningOutcome
 	Schema      string `json:"schema"`
 	OperationID string `json:"operation_id"`
 	Revision    uint64 `json:"revision,omitempty"`
 }
 
 type CoreInstallResult struct {
+	WarningOutcome
 	Schema   string `json:"schema"`
 	Version  string `json:"version"`
 	Updated  bool   `json:"updated"`
@@ -149,6 +154,8 @@ type CoreInstallResult struct {
 }
 
 type StreamEvent struct {
+	Terminal   bool            `json:"terminal,omitempty"`
+	Diagnostic *Diagnostic     `json:"diagnostic,omitempty"`
 	Schema     string          `json:"schema"`
 	Stream     string          `json:"stream"`
 	ObservedAt time.Time       `json:"observed_at,omitzero"`

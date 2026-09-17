@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -868,6 +869,26 @@ func TestRail_DigitShortcutWorksFromContentFocus(t *testing.T) {
 	}
 }
 
+// Overview has no in-page keyboard targets (it is not ContentFocusable), so
+// digit-jumping there from another page's content must park on the rail
+// instead of carrying FocusContent into the page.
+func TestRail_DigitShortcutToOverviewDropsContentFocus(t *testing.T) {
+	model := NewModel()
+	model.inputMode = ui.InputNavigation
+	model = updateModelKey(t, model, tea.KeyPressMsg{Code: tea.KeyDown})
+	model = updateModelKey(t, model, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if model.active != ui.PageProxies || model.focus.Area != ui.FocusContent {
+		t.Fatalf("enter focus=%v active=%s", model.focus.Area, model.active)
+	}
+	model = updateModelKey(t, model, tea.KeyPressMsg{Code: '1', Text: "1"})
+	if model.active != ui.PageOverview || model.railIndex != 0 {
+		t.Fatalf("digit 1 from content: active=%s railIndex=%d", model.active, model.railIndex)
+	}
+	if model.focus.Area != ui.FocusRail {
+		t.Fatalf("Overview entered via digit jump: focus=%v", model.focus.Area)
+	}
+}
+
 // In text-input mode (form / search focused) digits must type, never switch pages.
 func TestRail_DigitShortcutDisabledInTextInputMode(t *testing.T) {
 	model := NewModel()
@@ -1181,7 +1202,7 @@ func TestModel_LoggingRevisionResetRejectsOldEventAndPageObservationUntilFloor(t
 
 	current := protocol.LoggingStatus{Revision: 11, Level: "warn", MaxSizeMB: 20, MaxFiles: 5}
 	model.applySessionEvent(session.Event{Kind: session.EventLogging, Epoch: 1, Logging: current})
-	if !model.loggingLoaded || model.loggingRevision == nil || *model.loggingRevision != 11 || model.loggingStatus != current {
+	if !model.loggingLoaded || model.loggingRevision == nil || *model.loggingRevision != 11 || !reflect.DeepEqual(model.loggingStatus, current) {
 		t.Fatalf("current observation not accepted: loaded=%v revision=%v status=%+v", model.loggingLoaded, model.loggingRevision, model.loggingStatus)
 	}
 	if applier.count() != applyCount+1 || page.synced != syncCount+1 {
@@ -1251,11 +1272,11 @@ func TestModel_LoggingObservationSendsSynchronizedStateToSystem(t *testing.T) {
 	model.pages[ui.PageSystem] = page
 	status := protocol.LoggingStatus{Revision: 0, Level: "debug", MaxSizeMB: 100, MaxFiles: 10}
 	model.applySessionEvent(session.Event{Kind: session.EventLogging, Epoch: 1, Logging: status})
-	if page.synced != 1 || page.lastSync.Epoch != 1 || !page.lastSync.Available || page.lastSync.Status != status {
+	if page.synced != 1 || page.lastSync.Epoch != 1 || !page.lastSync.Available || !reflect.DeepEqual(page.lastSync.Status, status) {
 		t.Fatalf("sync count=%d message=%+v", page.synced, page.lastSync)
 	}
 	model.SetLocalLoggingHealth(testLoggingHealth{available: true})
-	if page.synced != 2 || !page.lastSync.Available || page.lastSync.Status != status {
+	if page.synced != 2 || !page.lastSync.Available || !reflect.DeepEqual(page.lastSync.Status, status) {
 		t.Fatalf("health refresh lost synchronized status: count=%d message=%+v", page.synced, page.lastSync)
 	}
 }
@@ -1280,7 +1301,7 @@ func TestModel_LoggingPageObservationAdvancesGlobalRevision(t *testing.T) {
 	if model.status.Revision != 6 || model.loggingRevision == nil || *model.loggingRevision != 6 {
 		t.Fatalf("global=%d logging=%v", model.status.Revision, model.loggingRevision)
 	}
-	if page.synced != 1 || page.lastSync.Status != after {
+	if page.synced != 1 || !reflect.DeepEqual(page.lastSync.Status, after) {
 		t.Fatalf("syncs=%d last=%+v", page.synced, page.lastSync)
 	}
 }
@@ -1330,15 +1351,19 @@ func TestModel_StatusDoesNotRegressWithinEpochButAcceptsNewEpoch(t *testing.T) {
 }
 
 func TestModel_LoggingUnavailableSyncLeavesRootTextInputMode(t *testing.T) {
-	model := NewModel()
-	page := &loggingResultRecordingPage{helpMode: ui.ModeLoggingEdit}
-	model.pages[ui.PageSystem] = page
-	model.active = ui.PageSystem
-	model.inputMode = ui.InputText
+	for _, mode := range []string{ui.ModeLoggingEdit, ui.ModeLoggingLevel, ui.ModeLoggingApplying} {
+		t.Run(mode, func(t *testing.T) {
+			model := NewModel()
+			page := &loggingResultRecordingPage{helpMode: mode}
+			model.pages[ui.PageSystem] = page
+			model.active = ui.PageSystem
+			model.inputMode = ui.InputText
 
-	model.syncSystemLoggingStatus(protocol.LoggingStatus{}, false)
-	if model.inputMode != ui.InputNavigation {
-		t.Fatalf("input mode=%v want navigation", model.inputMode)
+			model.syncSystemLoggingStatus(protocol.LoggingStatus{}, false)
+			if model.inputMode != ui.InputNavigation {
+				t.Fatalf("input mode=%v want navigation", model.inputMode)
+			}
+		})
 	}
 }
 

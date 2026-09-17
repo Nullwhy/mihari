@@ -16,6 +16,9 @@ import (
 // Trusted TUN changes prepare source-derived bytes before mutation ownership.
 // Settings/catalog/cache remain restart authority; no new graph WAL is created.
 func (m *Manager) mutateTrustedTun(ctx context.Context, op Operation, enable, force bool) (protocol.TunStatus, error) {
+	if err := m.SyncLogging(ctx); err != nil {
+		return protocol.TunStatus{}, err
+	}
 	if err := m.lockMutation(ctx); err != nil {
 		return protocol.TunStatus{}, err
 	}
@@ -69,7 +72,7 @@ func (m *Manager) mutateTrustedTun(ctx context.Context, op Operation, enable, fo
 	if catalog.ActiveID != "" {
 		raw, _, err := m.subscriptions.ReadCache(catalog.ActiveID)
 		if err != nil || sha256.Sum256(raw) != sourceHash {
-			return protocol.TunStatus{}, protocol.APIError{Code: protocol.CodeRevisionConflict, Message: "subscription cache changed during TUN preparation"}
+			return protocol.TunStatus{}, diagnostics.Wrap(protocol.APIError{Code: protocol.CodeRevisionConflict, Message: "subscription cache changed during TUN preparation"}, err)
 		}
 	}
 	previous, err := m.trustedCore.PreviousConfig(ctx)

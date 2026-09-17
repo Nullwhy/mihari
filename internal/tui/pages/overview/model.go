@@ -3,12 +3,14 @@ package overview
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/mihari-proxy/mihari/internal/control/protocol"
+	"github.com/mihari-proxy/mihari/internal/diagnostics"
 	"github.com/mihari-proxy/mihari/internal/service"
 	"github.com/mihari-proxy/mihari/internal/tui/ui"
 )
@@ -144,7 +146,8 @@ func (m *Model) View() string {
 // the global arrow pair; then the UL/DL trend sparklines with the live rate
 // fixed at the end of each chart line (no standalone rate row — the rates
 // update every stream tick and would otherwise shift line width).
-// Core PID/restarts stay on the System page (design G6).
+// Up Since and Restarts sit on one row below UL/DL; the row wraps when the
+// card is too narrow to keep the full date and count together.
 func (m *Model) renderCoreCard(inner int) string {
 	coreStatusRaw := valueOr(m.snapshot.Core.Status, ui.UnknownLabel)
 	coreTone := ui.ClassifyStatusTone(coreStatusRaw)
@@ -168,9 +171,14 @@ func (m *Model) renderCoreCard(inner int) string {
 		ui.StyleTrafficPair(m.theme,
 			"↑"+ui.FormatBytes(m.snapshot.Monitor.UploadTotal),
 			"↓"+ui.FormatBytes(m.snapshot.Monitor.DownloadTotal)))
-	// Reserve a fixed width for the trailing rate so chart lines never shift.
-	const rateReserve = 12 // " 999.9 GiB/s" worst case
-	chartWidth := min(50, max(8, inner-len(ui.MonitorUploadShort)-1-rateReserve))
+	uploadRate := ui.FormatRate(m.snapshot.Monitor.UploadRate)
+	downloadRate := ui.FormatRate(m.snapshot.Monitor.DownloadRate)
+	// Budget against printable width, excluding the card's horizontal padding.
+	// Keep a stable reserve for typical rates, growing it for longer values.
+	// Both charts share the same width; narrow cards shrink the charts first.
+	rateReserve := max(12, 1+lipgloss.Width(uploadRate), 1+lipgloss.Width(downloadRate))
+	labelWidth := max(lipgloss.Width(ui.MonitorUploadShort), lipgloss.Width(ui.MonitorDownloadShort))
+	chartWidth := min(50, max(0, ui.SectionTextWidth(inner)-labelWidth-1-rateReserve))
 	upload := make([]int64, len(m.snapshot.Monitor.Traffic))
 	download := make([]int64, len(m.snapshot.Monitor.Traffic))
 	for index, point := range m.snapshot.Monitor.Traffic {
@@ -178,15 +186,29 @@ func (m *Model) renderCoreCard(inner int) string {
 	}
 	return strings.Join([]string{
 		line1, line2,
-		ui.MonitorUploadShort + " " + ui.Sparkline(upload, chartWidth) + " " + ui.FormatRate(m.snapshot.Monitor.UploadRate),
-		ui.MonitorDownloadShort + " " + ui.Sparkline(download, chartWidth) + " " + ui.FormatRate(m.snapshot.Monitor.DownloadRate),
+		ui.MonitorUploadShort + " " + ui.Sparkline(upload, chartWidth) + " " + uploadRate,
+		ui.MonitorDownloadShort + " " + ui.Sparkline(download, chartWidth) + " " + downloadRate,
+		formatCoreLifetime(inner, m.snapshot.Core.StartedAt, m.snapshot.Core.Restarts),
 	}, "\n")
 }
 
+func formatCoreLifetime(inner int, started time.Time, restarts uint64) string {
+	clock := ui.MissingValue
+	if !started.IsZero() {
+		clock = started.Local().Format("2006-01-02 15:04")
+	}
+	left := ui.UpSinceLabel + " " + clock
+	right := ui.RestartsLabel + " " + strconv.FormatUint(restarts, 10)
+	line := left + "  " + right
+	if lipgloss.Width(line) <= ui.SectionTextWidth(inner) {
+		return line
+	}
+	return left + "\n" + right
+}
+
 // formatConfigHealth renders the config state as the General card's Health row.
-// The ok phrase is long, so it wraps within the value column with continuation
-// lines indented under the value; the raw Desired/Observed revision numbers
-// stay on the System page.
+// wrapStatusDot still wraps if the value column is too narrow; the raw
+// Desired/Observed revision numbers stay on the System page.
 func formatConfigHealth(theme ui.Theme, snap Snapshot, valueWidth int) string {
 	current := snap.Status.Config
 	if current == nil {
@@ -196,7 +218,7 @@ func formatConfigHealth(theme ui.Theme, snap Snapshot, valueWidth int) string {
 		// A failed apply (e.g. rollback) carries the actionable detail.
 		indent := strings.Repeat(" ", overviewLabelWidth+2)
 		return ui.StatusDot(theme, ui.ToneNegative, ui.ConfigFailedLabel) +
-			"\n" + indent + ui.ToneStyle(theme, ui.ToneNegative).Render(current.LastError)
+			"\n" + indent + ui.ToneStyle(theme, ui.ToneNegative).Render(diagnostics.EscapeTerminal(current.LastError))
 	}
 	switch valueOr(current.Status, ui.UnknownLabel) {
 	case "ok":
@@ -253,6 +275,7 @@ func (m *Model) renderGeneralBody(inner int) string {
 		{ui.OverviewSysProxyLabel, formatSysProxyValue(m.theme, m.snapshot)},
 		{ui.OverviewTunLabel, formatTunValue(m.theme, m.snapshot)},
 		{ui.OverviewHealthLabel, formatConfigHealth(m.theme, m.snapshot, inner-overviewLabelWidth-2)},
+		{ui.UpSinceLabel, formatOverviewClock(m.snapshot.Status.StartedAt)},
 	}
 	lines := make([]string, 0, len(rows))
 	for _, row := range rows {
@@ -260,6 +283,13 @@ func (m *Model) renderGeneralBody(inner int) string {
 		lines = append(lines, label+"  "+row.value)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func formatOverviewClock(started time.Time) string {
+	if started.IsZero() {
+		return ui.MissingValue
+	}
+	return started.Local().Format("2006-01-02 15:04")
 }
 
 func formatServiceValue(theme ui.Theme, snap Snapshot) string {
@@ -383,7 +413,7 @@ func renderActiveSubscription(list protocol.SubscriptionList, stale bool) string
 			subscription += " · " + ui.StaleLabel
 		}
 		if profile.LastError != "" {
-			subscription += "\n" + profile.LastError
+			subscription += "\n" + diagnostics.EscapeTerminal(profile.LastError)
 		}
 		return subscription
 	}

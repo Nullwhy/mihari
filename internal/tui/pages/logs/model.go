@@ -5,16 +5,24 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/mihari-proxy/mihari/internal/control/protocol"
+	"github.com/mihari-proxy/mihari/internal/diagnostics"
 	"github.com/mihari-proxy/mihari/internal/tui/ui"
 )
 
 const defaultCapacity = 10_000
+
+func normalizeLevel(level string) string {
+	level = strings.ToLower(level)
+	if level == "warning" {
+		return "warn"
+	}
+	return level
+}
 
 type focusKind uint8
 
@@ -26,6 +34,7 @@ const (
 
 type detailState struct {
 	entry Entry
+	raw   string
 }
 
 type Model struct {
@@ -35,7 +44,8 @@ type Model struct {
 	focused        int
 	following      bool
 	scrollUnread   int
-	level          string
+	levels         levelSelection
+	levelDialog    *levelDialogState
 	query          string
 	queryCursor    int
 	searching      bool
@@ -52,7 +62,7 @@ func New(capacity int) *Model {
 	if capacity <= 0 {
 		capacity = defaultCapacity
 	}
-	return &Model{buffer: NewBuffer(capacity), following: true, focus: focusControl, theme: ui.DefaultTheme()}
+	return &Model{buffer: NewBuffer(capacity), following: true, levels: allLevels, focus: focusControl, theme: ui.DefaultTheme()}
 }
 
 func (m *Model) ID() ui.PageID { return ui.PageLogs }
@@ -62,6 +72,8 @@ func (m *Model) SetContentFocused(focused bool) { m.contentFocused = focused }
 
 func (m *Model) HelpMode() string {
 	switch {
+	case m.levelDialog != nil:
+		return ui.ModeLogFilter
 	case m.detail != nil:
 		return ui.ModeDetail
 	case m.searching:
@@ -96,7 +108,7 @@ func (m *Model) Append(entry Entry) {
 }
 
 func (m *Model) visibleCount() int {
-	if m.level == "" && strings.TrimSpace(m.query) == "" {
+	if m.levels == allLevels && strings.TrimSpace(m.query) == "" {
 		return m.buffer.Len()
 	}
 	return len(m.visibleEntries())
@@ -107,13 +119,20 @@ func (m *Model) Observe(entry protocol.LogEntry, observedAt time.Time) {
 }
 
 func (m *Model) SetFilter(level, query string) {
-	m.level, m.query = level, query
+	m.levels, m.query = selectionForLevel(level), query
 	m.reconcileFocus()
 }
 
 func (m *Model) Unread() int { return m.scrollUnread + m.buffer.Unread() }
 
 func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
+	if m.levelDialog != nil {
+		return m.updateLevelDialog(message)
+	}
+	if key, ok := message.(tea.KeyPressMsg); ok && key.String() == "ctrl+f" {
+		cmd, _ := m.FocusSearch()
+		return m, cmd
+	}
 	if m.searching {
 		return m.updateSearch(message)
 	}
@@ -190,7 +209,18 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 		}
 		entries := m.visibleEntries()
 		if m.focused >= 0 && m.focused < len(entries) {
-			m.detail = &detailState{entry: entries[m.focused]}
+			entry := entries[m.focused]
+			m.detail = &detailState{entry: entry, raw: ui.UnavailableTitle}
+			encoded, err := json.MarshalIndent(struct {
+				ObservedAt time.Time `json:"observed_at,omitzero"`
+				Level      string    `json:"type"`
+				Message    string    `json:"payload"`
+			}{entry.ObservedAt, entry.Log.Level, entry.Log.Message}, "", "  ")
+			if err != nil {
+				failure := fmt.Errorf("encode log details: %w", err)
+				return m, func() tea.Msg { return ui.DiagnosticMsg{Page: ui.PageLogs, Err: failure} }
+			}
+			m.detail.raw = string(encoded)
 		}
 		return m, nil
 	}
@@ -198,10 +228,9 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 }
 
 func (m *Model) View() string {
-	level := valueOr(m.level, ui.FilterAllLabel)
 	controlFocused := m.contentFocused && m.focus == focusControl
 	control := ui.RenderControlStrip(m.theme, []string{
-		fmt.Sprintf("%s: %s", ui.LevelLabel, ui.StyleLogLevel(m.theme, level)),
+		fmt.Sprintf("%s: %s", ui.LevelLabel, m.renderLevelSummary()),
 		fmt.Sprintf("%s: %s", ui.WrapLabel, ui.StatusDot(m.theme, ui.ClassifyStatusTone(onOff(m.wrap)), onOff(m.wrap))),
 		fmt.Sprintf("%s: %s", ui.PauseLabel, ui.StatusDot(m.theme, ui.ClassifyStatusTone(onOff(m.buffer.Paused())), onOff(m.buffer.Paused()))),
 		ui.ExportLabel,
@@ -253,6 +282,9 @@ func (m *Model) View() string {
 	if m.detail != nil {
 		content = m.renderDetail()
 	}
+	if m.levelDialog != nil {
+		return m.renderLevelDialog(content)
+	}
 	return content
 }
 
@@ -285,7 +317,7 @@ func (m *Model) visibleEntries() []Entry {
 	result := make([]Entry, 0, len(entries))
 	visible := []string{"time", "level", "message"}
 	for _, entry := range entries {
-		if m.level != "" && !strings.EqualFold(entry.Log.Level, m.level) {
+		if !m.levels.matches(entry.Log.Level) {
 			continue
 		}
 		timestamp := ui.MissingValue
@@ -355,14 +387,7 @@ func (m *Model) renderEntry(entry Entry, focused bool) []string {
 func (m *Model) renderDetail() string {
 	entry := m.detail.entry
 	safe := protocol.LogEntry{Level: safeLine(entry.Log.Level), Message: safeMultiline(entry.Log.Message)}
-	raw := ui.UnavailableTitle
-	if encoded, err := json.MarshalIndent(struct {
-		ObservedAt time.Time `json:"observed_at,omitzero"`
-		Level      string    `json:"type"`
-		Message    string    `json:"payload"`
-	}{ObservedAt: entry.ObservedAt, Level: safe.Level, Message: safe.Message}, "", "  "); err == nil {
-		raw = string(encoded)
-	}
+	raw := diagnostics.EscapeTerminal(m.detail.raw)
 	timestamp := ui.MissingValue
 	if !entry.ObservedAt.IsZero() {
 		timestamp = entry.ObservedAt.Local().Format(time.RFC3339)
@@ -375,8 +400,7 @@ func (m *Model) renderDetail() string {
 func (m *Model) activateControl() tea.Cmd {
 	switch m.controlIndex {
 	case 0:
-		m.level = cycleValue(m.level, []string{"debug", "info", "warning", "warn", "error"})
-		m.reconcileFocus()
+		m.openLevelDialog()
 	case 1:
 		m.wrap = !m.wrap
 	case 2:
@@ -446,6 +470,14 @@ func (m *Model) updateSearch(message tea.Msg) (ui.Page, tea.Cmd) {
 	return m, nil
 }
 
+// FocusSearch focuses the query at its end unless a page dialog owns input.
+func (m *Model) FocusSearch() (tea.Cmd, bool) {
+	if m.detail != nil || m.levelDialog != nil {
+		return nil, false
+	}
+	return m.startSearch(), true
+}
+
 func (m *Model) startSearch() tea.Cmd {
 	m.searching = true
 	m.focus = focusSearch
@@ -487,13 +519,7 @@ func safeLine(value string) string {
 }
 
 func safeMultiline(value string) string {
-	var builder strings.Builder
-	for _, r := range value {
-		if r == '\n' || r == '\t' || (!unicode.IsControl(r) && r != '\x1b') {
-			builder.WriteRune(r)
-		}
-	}
-	return builder.String()
+	return diagnostics.EscapeTerminal(value)
 }
 
 func wrapText(value string, width int) []string {
@@ -511,28 +537,6 @@ func wrapText(value string, width int) []string {
 		runes = runes[end:]
 	}
 	return lines
-}
-
-func cycleValue(current string, values []string) string {
-	if current == "" {
-		return values[0]
-	}
-	for index, value := range values {
-		if strings.EqualFold(current, value) {
-			if index+1 == len(values) {
-				return ""
-			}
-			return values[index+1]
-		}
-	}
-	return values[0]
-}
-
-func valueOr(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
 }
 
 func onOff(value bool) string {

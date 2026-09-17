@@ -10,6 +10,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	lipgloss "charm.land/lipgloss/v2"
 	"github.com/mihari-proxy/mihari/internal/control/protocol"
 	proxypage "github.com/mihari-proxy/mihari/internal/tui/pages/proxies"
 	systempage "github.com/mihari-proxy/mihari/internal/tui/pages/system"
@@ -36,7 +37,6 @@ func TestGoldenRoutingMode(t *testing.T) {
 		width, height int
 	}{{"compact", 72, 22}, {"full", 100, 28}} {
 		t.Run(size.name, func(t *testing.T) {
-			freezeUTC(t)
 			model := goldenModel(t, ui.PageProxies, size.width, size.height)
 			model.applySessionEvent(session.Event{Kind: session.EventStatus, Epoch: 1, Status: protocol.Status{Health: "ok", Revision: 3, Capabilities: []string{protocol.CapabilityProxies, protocol.CapabilityRouting}}})
 			model.applySessionEvent(session.Event{Kind: session.EventRouting, Epoch: 1, Routing: protocol.RoutingStatus{Revision: 3, DesiredMode: "rule", LiveMode: "rule", State: "applied", GlobalSelection: "DIRECT", LiveGlobalSelection: "DIRECT"}})
@@ -60,13 +60,11 @@ func TestGoldenRoutingMode(t *testing.T) {
 	}
 }
 
-// freezeUTC pins time.Local so any .Local() formatting in the rendered pages is
-// deterministic across machines. Cleanup restores the original zone.
-func freezeUTC(t *testing.T) {
-	t.Helper()
-	orig := time.Local
+// TestMain fixes the test process timezone before tests start timers or workers.
+// Changing time.Local between golden cases races with time.Now in those workers.
+func TestMain(m *testing.M) {
 	time.Local = time.UTC
-	t.Cleanup(func() { time.Local = orig })
+	os.Exit(m.Run())
 }
 
 func goldenModel(t *testing.T, page ui.PageID, width, height int) Model {
@@ -128,7 +126,6 @@ func fullCapabilities() []string {
 }
 
 func TestGoldenOverviewFull(t *testing.T) {
-	freezeUTC(t)
 	model := goldenModel(t, ui.PageOverview, 100, 28)
 	model.applySessionEvent(session.Event{Kind: session.EventStatus, Status: protocol.Status{
 		Schema: "mihari/v1", Revision: 1, Capabilities: fullCapabilities(),
@@ -150,7 +147,6 @@ func TestGoldenOverviewFull(t *testing.T) {
 }
 
 func TestGoldenProxiesFull(t *testing.T) {
-	freezeUTC(t)
 	model := goldenModel(t, ui.PageProxies, 100, 28)
 	model.applySessionEvent(session.Event{Kind: session.EventStatus, Status: protocol.Status{
 		Schema: "mihari/v1", Revision: 1, Capabilities: []string{protocol.CapabilityProxies},
@@ -168,35 +164,116 @@ func TestGoldenProxiesFull(t *testing.T) {
 	assertGolden(t, "full/proxies", model)
 }
 
+// TestGoldenConnectionsDetailFull pins the complete wide connection detail.
 func TestGoldenConnectionsDetailFull(t *testing.T) {
-	freezeUTC(t)
-	model := goldenModel(t, ui.PageConnections, 100, 28)
+	goldenConnectionDetail(t, "full/connections-detail", 110, 40, false, false, false, nil)
+}
+
+// TestGoldenConnectionsDetailVariants pins compact and retained-observation states.
+func TestGoldenConnectionsDetailVariants(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		width, height          int
+		closed, paused, bottom bool
+	}{
+		{"compact", 72, 22, false, false, false},
+		{"closed", 110, 40, true, false, false},
+		{"paused", 100, 28, false, true, false},
+		{"bottom", 72, 22, true, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			goldenConnectionDetail(t, "full/connections-detail-"+tc.name, tc.width, tc.height, tc.closed, tc.paused, tc.bottom, nil)
+		})
+	}
+}
+
+// goldenConnectionDetail enters the real detail through page navigation before capture.
+func goldenConnectionDetail(t *testing.T, name string, width, height int, closed, paused, bottom bool, connection *protocol.Connection) {
+	t.Helper()
+	model := goldenModel(t, ui.PageConnections, width, height)
 	model.applySessionEvent(session.Event{Kind: session.EventStatus, Status: protocol.Status{
 		Schema: "mihari/v1", Revision: 1, Capabilities: []string{protocol.CapabilityConnections},
 	}})
-	model.applySessionEvent(session.Event{Kind: session.EventPreferences, Preferences: protocol.TUIPreferences{
-		Revision: 1, ConnectionsColumns: []string{"host", "network", "chain", "traffic"},
-	}})
-	start := time.Unix(1700000000, 0).UTC()
+	start := time.Date(2026, 9, 16, 10, 30, 0, 0, time.UTC)
+	if connection == nil {
+		connection = &protocol.Connection{
+			ID: "8d37b6a2-51a4-4f9e-b1d9-6e84b12fa205", Start: start,
+			Upload: 2048, Download: 4096, UploadSpeed: 1024, DownloadSpeed: 3072,
+			Chains: []string{"Japan 01", "Auto Select", "Proxy"}, Rule: "DomainSuffix", RulePay: "example.test",
+			Metadata: protocol.ConnectionMetadata{Network: "TCP", Type: "HTTP", Host: "api.example.test",
+				SourceIP: "192.168.1.12", SourcePort: "52341", DestinationIP: "203.0.113.24", DestinationPort: "443",
+				Process: "chrome.exe", ProcessPath: "C:/Apps/Browser/chrome.exe", InboundName: "mixed-in"},
+		}
+	}
 	model.applySessionEvent(session.Event{Kind: session.EventConnections, ObservedAt: start, Connections: protocol.ConnectionList{
-		UploadTotal: 2048, DownloadTotal: 8192,
-		Connections: []protocol.Connection{{
-			ID: "conn-1", Upload: 1024, Download: 4096,
-			Chains: []string{"DIRECT"}, Rule: "DOMAIN-SUFFIX",
-			Metadata: protocol.ConnectionMetadata{Network: "TCP", Host: "example.com",
-				SourceIP: "127.0.0.1", DestinationIP: "93.184.216.34", Process: "curl"},
-		}},
+		Connections: []protocol.Connection{*connection},
 	}})
 	page := model.pages[ui.PageConnections]
 	page.FocusFirst()
-	page = updatePage(page, tea.KeyPressMsg{Code: tea.KeyDown})
+	if closed {
+		model.applySessionEvent(session.Event{Kind: session.EventConnections, ObservedAt: start.Add(time.Minute), Connections: protocol.ConnectionList{}})
+		page = updatePage(page, tea.KeyPressMsg{Code: tea.KeyEnter}) // Active -> Closed dataset.
+	}
+	if paused {
+		page = updatePage(page, tea.KeyPressMsg{Code: 'p', Text: "p"})
+	}
+	// Control -> search -> header -> first row, then open its detail.
+	for range 3 {
+		page = updatePage(page, tea.KeyPressMsg{Code: tea.KeyDown})
+	}
 	page = updatePage(page, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if !strings.Contains(normalizeRender(page.View()), ui.ConnectionDetailsTitle) {
+		t.Fatal("golden must enter connection details before capturing the view")
+	}
+	if bottom {
+		for range 100 {
+			page = updatePage(page, tea.KeyPressMsg{Code: tea.KeyDown})
+		}
+	}
 	model.pages[ui.PageConnections] = page
-	assertGolden(t, "full/connections-detail", model)
+	beforeDiagnostics := model.View().Content
+	next, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyF2})
+	model = next.(Model)
+	if !model.diagnosticWindow.open {
+		t.Fatal("connection detail intercepted global F2")
+	}
+	next, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	model = next.(Model)
+	if model.View().Content != beforeDiagnostics {
+		t.Fatal("closing diagnostics changed the connection detail or scroll position")
+	}
+	rendered := model.View().Content
+	if lipgloss.Width(rendered) > width || lipgloss.Height(rendered) > height {
+		t.Fatalf("shell exceeds %dx%d: %dx%d", width, height, lipgloss.Width(rendered), lipgloss.Height(rendered))
+	}
+	view := trimRenderPadding(normalizeRender(rendered))
+	if !strings.Contains(view, ui.ConnectionDetailsTitle) {
+		t.Fatalf("shell did not render the detail:\n%s", view)
+	}
+	assertGoldenContent(t, name, view)
+}
+
+func TestGoldenConnectionsRouteStates(t *testing.T) {
+	for _, outbound := range []string{"DIRECT", "REJECT"} {
+		t.Run(outbound, func(t *testing.T) {
+			c := protocol.Connection{
+				ID: "route-state", Start: time.Date(2026, 9, 16, 10, 30, 0, 0, time.UTC),
+				Rule: "DomainSuffix", RulePay: "example.test", Chains: []string{outbound, "Local"},
+				Metadata: protocol.ConnectionMetadata{
+					Host: "api.example.test", DestinationIP: "203.0.113.24", DestinationPort: "443",
+					Type: "Tun", Network: "tcp", InboundName: "DEFAULT-TUN", Process: "browser.exe",
+					SourceIP: "198.18.0.1", SourcePort: "52341",
+				},
+			}
+			if outbound == "DIRECT" {
+				c.Metadata.RemoteDestination = c.Metadata.DestinationIP
+			}
+			goldenConnectionDetail(t, "full/connections-detail-"+strings.ToLower(outbound), 110, 40, true, false, false, &c)
+		})
+	}
 }
 
 func TestGoldenLogsCompact(t *testing.T) {
-	freezeUTC(t)
 	model := goldenModel(t, ui.PageLogs, 72, 22)
 	model.applySessionEvent(session.Event{Kind: session.EventStatus, Status: protocol.Status{
 		Schema: "mihari/v1", Revision: 1, Capabilities: []string{protocol.CapabilityLogs},
@@ -214,7 +291,6 @@ func TestGoldenLogsCompact(t *testing.T) {
 }
 
 func TestGoldenSystemLoggingFull(t *testing.T) {
-	freezeUTC(t)
 	t.Setenv("MIHARI_DATA", t.TempDir())
 	model := goldenModel(t, ui.PageSystem, 100, 40)
 	model.applySessionEvent(session.Event{Kind: session.EventConnected})
@@ -239,7 +315,6 @@ func TestGoldenSystemLoggingFull(t *testing.T) {
 }
 
 func TestGoldenWebGUIUnavailable(t *testing.T) {
-	freezeUTC(t)
 	model := goldenModel(t, ui.PageWebGUI, 100, 28)
 	model.applySessionEvent(session.Event{Kind: session.EventStatus, Status: protocol.Status{
 		Schema: "mihari/v1", Revision: 1, Capabilities: []string{protocol.CapabilityCore},
@@ -248,7 +323,6 @@ func TestGoldenWebGUIUnavailable(t *testing.T) {
 }
 
 func TestGoldenStaleState(t *testing.T) {
-	freezeUTC(t)
 	model := goldenModel(t, ui.PageOverview, 100, 28)
 	model.applySessionEvent(session.Event{Kind: session.EventStatus, Status: protocol.Status{
 		Schema: "mihari/v1", Revision: 1, Capabilities: []string{protocol.CapabilityCore},

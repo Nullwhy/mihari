@@ -88,8 +88,9 @@ type Model struct {
 }
 
 type closeResultMsg struct {
-	id  string
-	err error
+	warnings protocol.WarningOutcome
+	id       string
+	err      error
 }
 
 // Err implements the shell's action-outcome contract so connection closes are
@@ -114,7 +115,7 @@ func New(client Client, newOperationID func() string) *Model {
 		newOperationID = defaultConnectionOperationID
 	}
 	return &Model{
-		client: client, newOperationID: newOperationID, history: NewHistory(500),
+		client: client, newOperationID: newOperationID, history: NewHistory(defaultHistoryLimit),
 		focus: pageFocus{kind: focusControl}, source: allSources,
 		// Default 5 columns = the 5 highest-priority slots in allColumnIDs order,
 		// so the checked set matches what a 100-column terminal actually shows.
@@ -141,12 +142,23 @@ func (m *Model) HelpMode() string {
 	}
 }
 
+// HelpContent explains compact rates without taking space from the table.
+func (m *Model) HelpContent() string {
+	return ui.RenderHelp(m.ID(), m.HelpMode()) + "\n\nTraffic (B/s): upload ↑, download ↓. K/M/G/T/P/E use powers of 1024.\nOpen connection details for full rates and the complete proxy chain."
+}
+
 // FooterHints returns contextual shortcuts for the root shell footer.
 func (m *Model) FooterHints() string {
 	return ui.RenderFooter(m.ID(), m.HelpMode(), ui.FooterOpt{})
 }
 
-func (m *Model) SetSize(width, height int) { m.width, m.height = width, height }
+// SetSize propagates the shell's usable content dimensions to an open detail.
+func (m *Model) SetSize(width, height int) {
+	m.width, m.height = width, height
+	if m.detail != nil {
+		m.detail.SetSize(max(0, width-m.theme.Content.GetHorizontalPadding()), height)
+	}
+}
 
 func (m *Model) FocusFirst() { m.focus = pageFocus{kind: focusControl} }
 
@@ -206,6 +218,10 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 	}
 	if m.columnsOpen {
 		return m.updateColumns(message)
+	}
+	if key, ok := message.(tea.KeyPressMsg); ok && key.String() == "ctrl+f" {
+		cmd, _ := m.FocusSearch()
+		return m, cmd
 	}
 	if m.searching {
 		return m.updateSearch(message)
@@ -344,8 +360,11 @@ func (m *Model) updateRow(key tea.KeyPressMsg) (ui.Page, tea.Cmd) {
 	return m, nil
 }
 
+// openDetail captures the selected observation and schedules only its public GeoIP lookup.
 func (m *Model) openDetail(connection protocol.Connection) tea.Cmd {
 	m.detail = NewDetail(connection, m.dataset == datasetClosed)
+	m.detail.paused = m.paused
+	m.detail.SetSize(max(0, m.width-m.theme.Content.GetHorizontalPadding()), m.height)
 	addresses := publicConnectionAddresses(connection)
 	if m.client == nil || len(addresses) == 0 {
 		m.detail.SetGeoIP(nil, nil)
@@ -415,6 +434,14 @@ func (m *Model) updateSearch(message tea.Msg) (ui.Page, tea.Cmd) {
 	}
 	// Page shortcuts disabled while typing (left/right already handled as cursor).
 	return m, nil
+}
+
+// FocusSearch focuses the query at its end unless a page dialog owns input.
+func (m *Model) FocusSearch() (tea.Cmd, bool) {
+	if m.detail != nil || m.columnsOpen {
+		return nil, false
+	}
+	return m.startSearch(), true
 }
 
 func (m *Model) startSearch() tea.Cmd {
@@ -565,8 +592,8 @@ func (m *Model) closeConnection(id string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, err := m.client.CloseConnection(ctx, id, protocol.MutationRequest{OperationID: operationID})
-		return closeResultMsg{id: id, err: err}
+		result, err := m.client.CloseConnection(ctx, id, protocol.MutationRequest{OperationID: operationID})
+		return closeResultMsg{id: id, err: err, warnings: result.WarningOutcome}
 	}
 }
 
@@ -578,8 +605,8 @@ func (m *Model) closeAllConnections() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, err := m.client.CloseAllConnections(ctx, protocol.MutationRequest{OperationID: operationID})
-		return closeResultMsg{err: err}
+		result, err := m.client.CloseAllConnections(ctx, protocol.MutationRequest{OperationID: operationID})
+		return closeResultMsg{err: err, warnings: result.WarningOutcome}
 	}
 }
 

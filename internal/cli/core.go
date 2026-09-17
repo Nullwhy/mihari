@@ -24,6 +24,13 @@ func newCoreCommand(dependencies Dependencies, options *runOptions) *cobra.Comma
 				return renderJSON(command.OutOrStdout(), status)
 			}
 			_, err = fmt.Fprintf(command.OutOrStdout(), "Core: %s\nVersion: %s\nPID: %d\nRestarts: %d\n", status.Status, status.Version, status.PID, status.Restarts)
+			if err != nil {
+				return err
+			}
+			if status.StartedAt.IsZero() {
+				return nil
+			}
+			_, err = fmt.Fprintf(command.OutOrStdout(), "Started: %s\n", status.StartedAt.Format("2006-01-02T15:04:05Z07:00"))
 			return err
 		},
 	})
@@ -53,7 +60,10 @@ func newCoreCommand(dependencies Dependencies, options *runOptions) *cobra.Comma
 					message = "installed"
 				}
 				_, err = fmt.Fprintf(command.OutOrStdout(), "Core %s: %s\n", message, result.Version)
-				return err
+				if err != nil {
+					return err
+				}
+				return renderWarnings(command.ErrOrStderr(), result.WarningOutcome)
 			},
 		})
 	}
@@ -76,7 +86,7 @@ func newCoreCommand(dependencies Dependencies, options *runOptions) *cobra.Comma
 			if options.json {
 				return renderJSON(command.OutOrStdout(), result)
 			}
-			return printMutation(command.OutOrStdout(), result)
+			return renderMutation(command, options, result)
 		},
 	})
 	return root

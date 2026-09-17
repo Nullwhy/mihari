@@ -19,6 +19,8 @@ Mihari 是面向 Windows、Linux 和 macOS 的跨平台 [mihomo](https://github.
 
 ![Overview](assets/overview.png)
 
+Overview 的 Core 卡片会缩短流量趋势图，为速度值及其单位保留同一行的显示空间。
+
 ## 这是什么?
 
 **TLDR**:Mihari 是 mihomo 的终端管理器——和 Clash Party、Sparkle 等 mihomo GUI 是同类工具,但它运行在终端里,并由一个守护进程在后台托管,CLI、TUI 和浏览器面板共享同一个控制面。
@@ -36,14 +38,15 @@ Mihari 是面向 Windows、Linux 和 macOS 的跨平台 [mihomo](https://github.
 
 - **一个守护进程,三种界面**:CLI、TUI 和浏览器面板经本地命名管道 / Unix 域套接字连接同一守护进程控制面,控制 API 从不绑定 TCP 端口。
 - **OS 服务托管**:可安装为 Windows 服务 / systemd 单元 / launchd 代理,带崩溃退避重启。
-- **订阅配置**:每个订阅独立缓存、离线切换、按配置独立的刷新间隔、按订阅的拉取代理(`direct` / `proxy` / `auto`;`auto` 在代理失败时回退直连),以及经过校验的原子化配置生成与回滚。
+- **订阅配置**:每个订阅独立缓存、离线切换、按配置独立的刷新间隔、按订阅的拉取代理(`direct` / `proxy` / `auto`;`auto` 在可回退的代理网络错误后尝试直连),以及经过校验的原子化配置生成与回滚。
 - **Web 面板**:一键安装 / 更新 / 激活 / 回滚 zashboard 与 MetaCubeXD,置于带独立访问凭据的回环 Web 网关之后。
 - **系统代理与 TUN**:跨平台的系统代理控制与托管 TUN,均由守护进程持有并持久化。若其他产品已持有系统代理(`system_proxy_conflict`),或检测到其他 TUN / mihomo 实例(`tun_conflict`),enable 会失败,除非传入 `--force`(TUI 会要求确认)。
 - **端口配置**:System 页面可修改 Mixed / Controller / Web 端口;占用显示 `Owned` 或 `Occupied by name (pid)`。应用后通常需要重启守护进程。
 - **TUI 内更新 Mihari**：System 页面进入时检查 GitHub Releases，显示 `当前版本 · 最新版本 available` 或 `当前版本 · Up to date`；以管理员/root 权限启动时可替换二进制、同步并重启已安装的系统服务副本、验证 daemon 版本，并自动进入更新后的 TUI。更新确认会将安全的非标准已安装构建标识显示为 `Unknown[标识]`，兼容性仍为未知；长内容可用 ↑/↓ 或 PgUp/PgDn 滚动，默认选择 Cancel。
 - **内核通道**:System 页面可在 mihomo 的 `stable` / `alpha` 通道之间切换。
+- **自动版本检查**：进入 System 时检查 core 当前通道，进入 Web GUI 时逐项检查所有支持的面板，包括尚未安装的面板。检查显示 `Checking…`、最新版本/构建、`Up to date` 或 `Check failed`；成功结果在本次 TUI 会话内缓存 5 分钟，失败时重新进入页面可重试。core 安装/通道切换，以及面板安装/更新/回滚/重装/卸载成功后，立即刷新对应版本检查。检查仅通过 daemon 查询元数据，安装仍需确认。
 
-Windows 更新可使用同一用户的非管理员令牌查询用户目录中的安装版本，包括默认的 AppData 安装位置。目录权限不安全或无法取得降权 UAC 令牌时，版本仍显示 unknown；版本查询不会以管理员权限执行用户可写的文件。
+Windows 更新可使用同一用户的非管理员令牌查询用户目录中的安装版本，包括默认的 AppData 安装位置。若降权 UAC 令牌只能识别身份，Mihari 会在核验同一用户、同一登录会话和非管理员权限后，使用桌面 Shell 的令牌。目录权限不安全或无法取得通过核验的令牌时，版本仍显示 unknown；版本查询不会以管理员权限执行用户可写的文件。
 
 单个无 CGO 的静态二进制(< 15 MB)即包含全部功能,内置 GitHub Releases 自动更新与本地 GeoIP 解析。
 
@@ -53,7 +56,11 @@ TUI 节点测速进行中时，卡片在协议名称旁仅显示盲文加载动�
 
 TUI 订阅表格的 Name 和 Traffic 列按内容分配宽度，分别最多占 32 和 24 个终端字符格；多余空间留在右侧，窄屏优先隐藏次要字段。
 
-mihomo HTTP 失败的原始报错与上游状态会写入诊断日志，范围包括 gateway 和 WebSocket 握手。文件日志及导出不脱敏，保留错误自带的凭据、URL、路径与配置片段以便排查；用户侧仍显示简洁关键原因。
+订阅下载 Mode 将 `auto` 显示为 **PROXY w Fallback to DIRECT**。回退覆盖主订阅 YAML 的连接超时和成功响应正文读取超时等可重试网络错误；HTTP 错误、无效文档不触发回退。每次代理/直连尝试保留 30 秒预算，daemon 的 Add/Refresh 整次执行上限为 120 秒，CLI/TUI 每条等待最多 180 秒以容纳有界回滚和响应。更短的调用方 deadline 与主动取消仍优先，批量刷新逐条计时。窄列表必要时整列隐藏 Mode，进入详情可查看完整值。Provider 下载策略及 Proxies 页 Routing Mode 独立于此设置。
+
+mihomo HTTP 失败的原始报错与上游状态会写入诊断日志，范围包括 gateway 和 WebSocket 握手。日志、导出及本地 CLI/TUI 错误汇报均不脱敏，保留错误自带的凭据、URL、路径与配置片段。CLI 分段展示概要、错误分类和原始详情，JSON 增加可选诊断和 warnings，业务退出码保持不变。TUI 所有页面均可按 F2 打开统一诊断历史，滚动查看详情并复制原文。终端控制字符仅在显示时转义。
+
+F2 每次发生保留独立记录，以级别颜色和选中高亮帮助浏览。宽终端左右显示列表和详情，窄终端上下排列。Tab 切换窗格，方向键、PgUp/PgDn、Home/End 导航，c 复制原始详情，Esc 返回；新记录不会抢走当前选择。Web gateway 允许来自 mihomo 的单条消息最大 1 MiB，与 mihomo 流客户端一致；浏览器发送方向仍限制为 32 KiB。
 
 ## 快速开始
 
@@ -154,6 +161,16 @@ mihari sysproxy enable
 
 完整命令参考见 [docs/commands.md](docs/commands.md),架构与安全机制见 [docs/architecture.md](docs/architecture.md)。
 
+**Connections** 为 Chain 分配更多宽度，窄窗口中优先于 Source、Destination、Rule 保留。Traffic 使用固定宽度的上下行紧凑速率，`K/M/G/T/P/E` 按 1024 进制表示字节每秒；连接详情仍显示完整速率与代理链。**Rules** 用居中弹窗展示规则或 provider 的完整详情，↑/↓ 或 PgUp/PgDn 滚动，Enter/Esc 关闭后返回原行。
+
+**Conns、Rules、Logs** 支持 Ctrl+F 从侧栏或页面内容区直接聚焦检索框，保留已有文字并将光标移到末尾；页面内容区仍支持 `/`。弹窗打开时不抢走焦点。Conns 在当前 TUI 会话中保留最新 **5000 条已关闭连接记录**，切页保留，重连或退出后清空；活动连接不占此配额。
+
+**Logs** 中选中 **Level** 后按 Enter 打开多选小窗。↑/↓ 移动，Space 勾选 DEBUG、INFO、WARNING、ERROR；**Select all** 用于全选或清空。Enter 应用、Esc 放弃，至少勾选一个级别。连续选到 ERROR 的组合显示为 `DEBUG+`、`INFO+` 或 `WARNING+`，其他组合完整列出，例如 `DEBUG, WARNING`。这只是显示摘要，筛选按所选精确级别匹配，再与文字检索取交集。切页和重连保留选择，重启 TUI 恢复全选；全选时也保留未知级别记录。筛选不修改 System 日志设置或实时流订阅。
+
+连接详情采用单个居中页面，以 **Application → Routing → Outbound → Destination** 纵向展示处理链路，字段归入对应阶段。Routing 合并显示入站名称／类型／协议和 **Rule Matched**，并从外层代理组到出站逐级展开上报的选择链；Outbound 展示 **Remote** 及其 GeoIP，Destination 保留自己的目标地址及 GeoIP，选择树不代表完整网络中转拓扑。上传速率与累计量为绿色，下载为蓝色；拒绝出站以断线连接灰色的请求目标节点。长字段自动换行，深层选择树保留层级序号，面板最大 88 个终端字符列。↑/↓ 滚动，Enter/Esc 返回选中行。**Paused** 表示观测数据已冻结；已关闭连接显示最后观测速率与累计流量，**Closed observed** 是 TUI 发现连接消失的时间，不是内核报告的精确关闭时间。
+
+**Web GUI** 面板卡片宽屏并排、窄屏纵排。Tab/Shift+Tab 或 ←/→ 选择 Open/Install 或 Manage，Enter 执行，↑/↓ 切换面板。安装或重装期间，对应卡片显示橘色 Installing 状态 badge 和动态盲文动画，操作结束后清除；原有面板快捷键保留。Manage 包含更新、设为默认、重装、回滚及卸载，不可用项标明原因。黄色 **Ctrl+Shift+R** 刷新提示始终保留在卡片上方，网关保护说明移至 `?` 帮助。**System** 的 Network 分区移至 Ports Config 之后。
+
 TUI **Proxies** 页顶部的 **Routing** 卡片包含 **Mode** 和 **GLOBAL**。**Mode** 按 Enter 打开 Rule / Global / Direct 选择弹窗，↑/↓ 选择、Enter 应用、Esc 取消；**GLOBAL** 入口展开 mihomo 返回的候选组，并自动滚动到整个 section 完整可见；超过一屏时从列表视口顶部展示，继续用方向键浏览候选。Mihari 全局保存模式、按订阅保存 GLOBAL 出口，支持面板发起的相同操作。默认使用 Rule，切换模式和出口保留已有连接。保存的出口消失时，有 DIRECT 候选则保存 DIRECT，否则保存 Rule；内核停止时保存的模式显示为 pending，待启动应用。
 
 Routing 标签为白色、值为绿色。仅焦点行在值后紧跟显示 `· Press Enter to Change` 或 `· Press Enter to Select`；窄屏优先保留值，空间不足时隐藏操作提示。状态说明不随失焦隐藏。
@@ -200,7 +217,11 @@ Unix 机器日志写入 D，本用户 TUI 日志写入 U；Windows/显式私有 
 | TUI（当前 UID 的实例共享） | `U/logs/mihari-tui.log` |
 | 捕获的 mihomo 输出 | `D/logs/mihomo.log` |
 
-守护进程与捕获的 mihomo 文件日志默认级别为 `info`，每个活跃文件到 10 MiB 时轮转，并保留三份文件（活跃文件加最多两份归档）。TUI 启动时使用 bootstrap 配置——级别 `debug`、100 MiB、10 份文件——以便在守护进程设置可用前也能记录日志；在后续控制面同步前会保持该 bootstrap 配置。TUI 的 System 页面可修改由守护进程持有的级别、单文件最大大小和保留数量，变更无需重启守护进程。捕获的 mihomo stdout 记为 `INFO`，stderr 记为 `WARN`；这些捕获级别不代表 mihomo 行内文本本身的严重程度。
+守护进程与捕获的 mihomo 文件日志默认级别为 `info`，每个活跃文件到 10 MiB 时轮转，并保留三份文件（活跃文件加最多两份归档）。TUI 启动时使用 bootstrap 配置——级别 `debug`、100 MiB、10 份文件——以便在守护进程设置可用前也能记录日志；在后续控制面同步前会保持该 bootstrap 配置。TUI 的 System 页面可修改由守护进程持有的级别、单文件最大大小和保留数量，变更无需重启守护进程。捕获 mihomo 输出时会识别文本/JSON 中的真实级别并保留原行；无法识别时，stdout 回退为 `INFO`，stderr 回退为 `WARN`。
+
+System → Logging → Level 同时控制 Mihari 文件日志与 mihomo 全局 `log-level`，生成配置覆盖订阅值但不修改原缓存。主动可选 `debug`、`info`、`warn`、`error`。在线修改经过校验、内核确认、reload 与保存，失败补偿恢复；内核停止时保存到下次启动应用。外部内核变化每 2 秒观察：保存失败保留内核现状、显示未保存并重试最新值。仅被动采纳内核的 `silent`，保留历史文件和操作错误提示，用户可切回四档。旧版本可能拒绝已保存的 `silent`，降级前应切回支持级别或恢复兼容的停机备份。TUI/Web 实时日志筛选独立于文件级别，silent 也不限制实时订阅。网关允许单字段 `PATCH /configs {"log-level":"debug"}`，混合及未知写入仍拒绝。
+
+选中 **Level** 后按 Enter，右侧以 `< INFO >` 整块高亮当前级别。←/→ 在 DEBUG、INFO、WARN、ERROR 间循环选择，再按 Enter 应用；Esc 放弃候选并显示最新实际值。编辑期间 ↑/↓ 和 Tab 不移动焦点；提交时显示 Applying 旋转动画并锁定编辑，成功返回 Level，失败保留候选以便重试。未改变值时直接退出，不发送请求；外部更新不会覆盖候选。从 SILENT 开始编辑时，→ 选 DEBUG、← 选 ERROR，SILENT 不加入主动选项。
 
 `GET /v1/logging` 与 `PATCH /v1/logging` 是供 TUI 使用的稳定 v1 本地控制端点，并非 CLI 命令。日志导出仅在 TUI 提供：可在 Logs 页按 `e`，或在 System → Logging 选择 **Export logs**。对话框支持最近 24 小时、最近 60 分钟、本地时间区间和全部记录。默认输出到 `U/logs-export/`；已有 zip 永不覆盖，自定义目标必须是既有目录中的绝对 `.zip` 路径。没有 CLI 日志导出命令。
 
@@ -243,3 +264,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/mihari ./cmd/mihari
 [GPL-3.0](LICENSE) © 2026 Mihar1
 
 Mihari 是一个独立项目,与 mihomo 项目或 MetaCubeX 无关联,也不受其背书。
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=mihari-proxy/mihari&type=date&legend=bottom-right)](https://www.star-history.com/?repos=mihari-proxy%2Fmihari&type=date&legend=bottom-right)

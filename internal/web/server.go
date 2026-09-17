@@ -719,6 +719,21 @@ func (s *Server) handleConfigMutation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if raw, exists := patch["log-level"]; exists {
+		if len(patch) != 1 || r.Method != http.MethodPatch {
+			s.reportMutationRejection(r.Context(), errors.New("logging level requires PATCH with exactly one field"))
+			WriteReject(w, ActionRejectUnknown)
+			return
+		}
+		level, ok := raw.(string)
+		if !ok || (level != "debug" && level != "info" && level != "warn" && level != "warning" && level != "error") {
+			s.reportMutationRejection(r.Context(), errors.New("invalid logging level"))
+			http.Error(w, "invalid logging level", http.StatusBadRequest)
+			return
+		}
+		s.applyConfigMutation(w, r, patch)
+		return
+	}
 	if raw, exists := patch["mode"]; exists {
 		if len(patch) != 1 || r.Method != http.MethodPatch {
 			s.reportMutationRejection(r.Context(), errors.New("routing mode requires PATCH with exactly one field"))
@@ -872,6 +887,15 @@ func webSocketRelayTermination(err error) (websocket.StatusCode, error) {
 	return -1, nil
 }
 
+const (
+	// Match the mihomo stream adapter's bounded snapshot capacity. Browser
+	// messages retain the smaller limit; they do not carry core snapshots.
+	maxUpstreamWebSocketMessage = 1 << 20
+	maxBrowserWebSocketMessage  = 32 << 10
+)
+
+// proxyWebSocket relays authenticated panel traffic with directional message
+// bounds and joins both copy loops before reporting their single terminal failure.
 func (s *Server) proxyWebSocket(w http.ResponseWriter, r *http.Request) {
 	controller, err := url.Parse(s.ControllerURL)
 	if err != nil {
@@ -904,6 +928,7 @@ func (s *Server) proxyWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer upstream.CloseNow()
+	upstream.SetReadLimit(maxUpstreamWebSocketMessage)
 
 	client, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
@@ -912,6 +937,7 @@ func (s *Server) proxyWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer client.CloseNow()
+	client.SetReadLimit(maxBrowserWebSocketMessage)
 
 	observer := s.wsObserver
 	if observer != nil {

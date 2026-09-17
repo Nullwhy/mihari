@@ -29,6 +29,16 @@ type recordingLoggingRuntime struct {
 	apply      func(context.Context, logging.Config)
 }
 
+func TestLogging_ActiveUpdateRejectsSilent(t *testing.T) {
+	runtime := &recordingLoggingRuntime{dir: "logs"}
+	manager := newTestManager(Options{Settings: config.Defaults(), Logging: runtime})
+	_, err := manager.UpdateLogging(t.Context(), Operation{ID: "silent-rejected", Source: "test"}, LoggingUpdate{Level: stringPointer("silent")})
+	assertLoggingAPIError(t, err, protocol.CodeInvalidArgument)
+	if runtime.applyCalls != 0 {
+		t.Fatal("rejected update applied")
+	}
+}
+
 func (r *recordingLoggingRuntime) Apply(ctx context.Context, cfg logging.Config) {
 	if r.apply != nil {
 		r.apply(ctx, cfg)
@@ -121,6 +131,7 @@ func TestLogging_StatusReturnsOneMaintenanceSnapshot(t *testing.T) {
 	}
 	want := protocol.LoggingStatus{
 		Schema: "mihari/v1", Revision: 7, Level: "debug", MaxSizeMB: 20, MaxFiles: 5, Dir: runtime.dir,
+		SyncState: "pending", SyncMessage: "Saved; waiting for the core to start",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("status=%#v want=%#v", got, want)
@@ -231,7 +242,7 @@ func TestLogging_UpdateCommitsSavePublishApplyRevisionInOrder(t *testing.T) {
 	if !slices.Equal(order, []string{"save", "apply", "warning"}) {
 		t.Fatalf("order=%v", order)
 	}
-	if got != (protocol.LoggingStatus{Schema: "mihari/v1", Revision: 1, Level: "debug", MaxSizeMB: 20, MaxFiles: 5, Dir: runtime.dir}) {
+	if !reflect.DeepEqual(got, protocol.LoggingStatus{Schema: "mihari/v1", Revision: 1, Level: "debug", MaxSizeMB: 20, MaxFiles: 5, Dir: runtime.dir, SyncState: "pending", SyncMessage: "Saved; waiting for the core to start"}) {
 		t.Fatalf("status=%#v", got)
 	}
 	if manager.Snapshot().Revision != 1 || runtime.applyCalls != 1 {
@@ -316,7 +327,7 @@ func TestLogging_SameOperationIDReturnsCommittedResultWithoutRepeating(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != second || saves.Load() != 1 || runtime.applyCalls != 1 || manager.Snapshot().Revision != 1 {
+	if !reflect.DeepEqual(first, second) || saves.Load() != 1 || runtime.applyCalls != 1 || manager.Snapshot().Revision != 1 {
 		t.Fatalf("first=%#v second=%#v saves=%d apply=%d revision=%d", first, second, saves.Load(), runtime.applyCalls, manager.Snapshot().Revision)
 	}
 }
@@ -422,7 +433,7 @@ func TestLogging_CommittedSaveIgnoresLateCancellationAndCachesResult(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != retry || first.Revision != 1 || saves.Load() != 1 || runtime.applyCalls != 1 || !applySawCancellation.Load() {
+	if !reflect.DeepEqual(first, retry) || first.Revision != 1 || saves.Load() != 1 || runtime.applyCalls != 1 || !applySawCancellation.Load() {
 		t.Fatalf("first=%#v retry=%#v saves=%d apply=%d canceled=%v", first, retry, saves.Load(), runtime.applyCalls, applySawCancellation.Load())
 	}
 }

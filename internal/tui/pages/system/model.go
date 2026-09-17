@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/atotto/clipboard"
 	"github.com/mihari-proxy/mihari/internal/app"
 	"github.com/mihari-proxy/mihari/internal/control/protocol"
+	"github.com/mihari-proxy/mihari/internal/diagnostics"
 	"github.com/mihari-proxy/mihari/internal/elevate"
 	"github.com/mihari-proxy/mihari/internal/logging"
 	"github.com/mihari-proxy/mihari/internal/platform"
@@ -318,6 +320,8 @@ var _ interface{ Err() error } = actionResultMsg{}
 
 // Model is the System page.
 type Model struct {
+	coreVersion           coreVersionState
+	channelDiagnostic     tea.Cmd
 	writeClipboard        func(string) error
 	ctx                   context.Context
 	client                Client
@@ -355,6 +359,7 @@ type Model struct {
 	webGUIErr             bool
 
 	logging               protocol.LoggingStatus
+	loggingLevelCandidate string
 	loggingEpoch          uint64
 	loggingAvailable      bool
 	localLoggingAvailable bool
@@ -398,7 +403,8 @@ type Model struct {
 type RestartRequiredMsg struct{}
 
 type portHoldsMsg struct {
-	holds map[string]ui.PortHold
+	failures []error
+	holds    map[string]ui.PortHold
 }
 
 type portsApplyResultMsg struct {
@@ -454,6 +460,12 @@ func NewWithContext(ctx context.Context, client Client, svc ServiceController, n
 
 func (m *Model) HelpMode() string {
 	if m.editID != "" {
+		if m.editID == rowLogLevel {
+			if m.pending {
+				return ui.ModeLoggingApplying
+			}
+			return ui.ModeLoggingLevel
+		}
 		if m.editID == rowLogMaxSize || m.editID == rowLogMaxFiles {
 			return ui.ModeLoggingEdit
 		}
@@ -578,7 +590,7 @@ func (m *Model) copyDirectoryRow(rowID, path string) tea.Cmd {
 	}
 	if err := write(path); err != nil {
 		m.markRowOutcome(rowID, false, ui.ExportCopyFailed)
-		return nil
+		return m.localFailure("clipboard.write", ui.ExportCopyFailed, err)
 	}
 	m.markRowOutcome(rowID, true, "")
 	return m.scheduleOutcomeFade(rowID)
@@ -646,7 +658,7 @@ func (m *Model) ApplyRootNetworkStatus(proxy protocol.SystemProxyStatus, proxyOK
 
 func (m *Model) SetMutationsEnabled(enabled bool) { m.mutationsEnabled = enabled }
 
-// Load refreshes onboarding, OS service status, system proxy, and TUN when available.
+// Load refreshes local status and checks Mihari and core versions when available.
 func (m *Model) Load() tea.Cmd {
 	return m.load(true)
 }
@@ -655,9 +667,12 @@ func (m *Model) refresh() tea.Cmd {
 	return m.load(false)
 }
 
-func (m *Model) load(checkMihari bool) tea.Cmd {
+func (m *Model) load(checkVersions bool) tea.Cmd {
 	var cmds []tea.Cmd
-	if checkMihari && m.selfUpdater != nil && !m.pending {
+	if checkVersions {
+		cmds = append(cmds, m.checkCoreVersion())
+	}
+	if checkVersions && m.selfUpdater != nil && !m.pending {
 		cmds = append(cmds, m.checkMihariVersion())
 	}
 	if m.client != nil && m.hasCapability(protocol.CapabilityOnboarding) {
@@ -696,13 +711,13 @@ func (m *Model) checkMihariVersion() tea.Cmd {
 	if err != nil {
 		m.mihariChannelFailed = true
 		m.markRowOutcome(rowMihariChannel, false, actionErrorDetail(err, ui.MihariChannelFailed))
-		return nil
+		return m.localFailure("self.channel.read", ui.MihariChannelFailed, err)
 	}
 	channel, err := m.readChannel(path)
 	if err != nil {
 		m.mihariChannelFailed = true
 		m.markRowOutcome(rowMihariChannel, false, actionErrorDetail(err, ui.MihariChannelFailed))
-		return nil
+		return m.localFailure("self.channel.read", ui.MihariChannelFailed, err)
 	}
 	m.mihariChannel = channel
 	m.mihariChannelLoaded = true
@@ -756,7 +771,19 @@ func (m *Model) loadWebGUI() tea.Cmd {
 	}
 }
 
-func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
+func (m *Model) Update(message tea.Msg) (page ui.Page, command tea.Cmd) {
+	// Lazy channel discovery may run during rendering. Retain at most one
+	// occurrence and deliver it on the next update, even without a file reporter.
+	defer func() {
+		if m.channelDiagnostic != nil {
+			if command == nil {
+				command = m.channelDiagnostic
+			} else {
+				command = tea.Batch(command, m.channelDiagnostic)
+			}
+			m.channelDiagnostic = nil
+		}
+	}()
 	defer func() {
 		if m.detail != nil {
 			return
@@ -765,7 +792,7 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 	}()
 	switch typed := message.(type) {
 	case ui.LoggingSyncMsg:
-		wasLoggingEdit := m.editID == rowLogMaxSize || m.editID == rowLogMaxFiles
+		wasLoggingEdit := m.editID == rowLogLevel || m.editID == rowLogMaxSize || m.editID == rowLogMaxFiles
 		m.ApplyLoggingSync(typed)
 		if !typed.Available {
 			if m.pending && isLoggingRow(m.pendingRow) {
@@ -784,14 +811,23 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 	case ui.LoggingObservedMsg:
 		if m.pending && typed.Epoch == m.loggingPendingEpoch {
 			rowID := m.pendingRow
-			current := typed.Epoch == m.loggingEpoch && m.loggingAvailable && typed.Status == m.logging
+			current := typed.Epoch == m.loggingEpoch && m.loggingAvailable && reflect.DeepEqual(typed.Status, m.logging)
 			reloading := m.loggingReloading
 			m.clearRowPending()
 			m.loggingPendingEpoch = 0
 			m.loggingReloading = false
 			if current && !reloading {
+				var leaveEdit tea.Cmd
+				if m.editID == rowLogLevel && rowID == rowLogLevel {
+					leaveEdit = m.cancelLoggingEdit()
+				}
 				m.markRowOutcome(rowID, true, "")
-				return m, m.scheduleOutcomeFade(rowID)
+				return m, tea.Batch(leaveEdit, m.scheduleOutcomeFade(rowID))
+			}
+			// A newer observation can supersede the reload without resolving the
+			// failed mutation. Keep its conflict visible alongside the candidate.
+			if typed.Epoch == m.loggingEpoch && m.loggingAvailable && reloading && m.editID == rowLogLevel {
+				m.markRowOutcome(rowID, false, ui.SystemChangedMessage)
 			}
 		}
 		return m, m.rowSpinCmdIfNeeded()
@@ -835,6 +871,23 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 		m.loggingReloading = false
 		m.markRowOutcome(typed.rowID, false, ui.LoggingReloadFailed)
 		return m, m.rowSpinCmdIfNeeded()
+	case coreVersionMsg:
+		if typed.generation != m.coreVersion.generation {
+			return m, nil
+		}
+		if m.coreVersion.channel != coreChannelName(m.core.Channel) {
+			return m, m.checkCoreVersion()
+		}
+		m.coreVersion.checking = false
+		m.coreVersion.failed = typed.err != nil || typed.result.Latest == ""
+		m.coreVersion.latest = typed.result.Latest
+		if !m.coreVersion.failed {
+			m.coreVersion.checkedAt = time.Now()
+		}
+		if typed.err == nil && typed.result.Channel != "" {
+			m.coreVersion.channel = typed.result.Channel
+		}
+		return m, nil
 	case selfCheckResultMsg:
 		if typed.generation != m.selfCheckGeneration {
 			return m, nil
@@ -958,7 +1011,11 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 		return m, nil
 	case coreLoadResultMsg:
 		if typed.err == nil {
+			previousChannel := coreChannelName(m.core.Channel)
 			m.core = typed.core
+			if previousChannel != coreChannelName(m.core.Channel) || m.coreVersion.channel != coreChannelName(m.core.Channel) {
+				return m, m.checkCoreVersion()
+			}
 		}
 		return m, nil
 	case ui.ActionPendingMsg:
@@ -1024,6 +1081,9 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 		revision := typed.restart.Revision
 		if typed.kind == actionUpdate || typed.kind == actionSwitchChannel {
 			revision = typed.install.Revision
+			// Reload the committed channel before checking, and reject any
+			// metadata request that started before this mutation finished.
+			m.coreVersion = coreVersionState{generation: m.coreVersion.generation + 1}
 		}
 		return m, tea.Batch(m.refresh(), m.loadCore(), func() tea.Msg { return ui.RuntimeRevisionMsg{Revision: revision} }, m.rowSpinCmdIfNeeded())
 	case serviceResultMsg:
@@ -1068,6 +1128,9 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 		return m, nil
 	}
 	if m.editID != "" {
+		if m.editID == rowLogLevel {
+			return m.updateLoggingLevelEdit(message)
+		}
 		if m.editID == rowLogMaxSize || m.editID == rowLogMaxFiles {
 			return m.updateLoggingEdit(message)
 		}
@@ -1154,7 +1217,7 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 		case rowMixed, rowController, rowWeb:
 			return m, m.beginPortEdit(m.focusID)
 		case rowLogLevel:
-			return m, m.cycleLoggingLevel()
+			return m, m.beginLoggingLevelEdit()
 		case rowLogMaxSize, rowLogMaxFiles:
 			return m, m.beginLoggingEdit(m.focusID)
 		case rowLogExport:
@@ -1278,12 +1341,14 @@ func (m *Model) buildSectionContent() (lines []string, focusStart, focusEnd int)
 		idx := len(sections) - 1
 		marker := "  "
 		rowFocused := item.id == m.focusID
-		if rowFocused {
+		if rowFocused && m.editID != rowLogLevel {
 			marker = ui.FocusMarker
 		}
 		labelPart := marker + item.label
 		value := item.value
 		switch {
+		case m.editID == rowLogLevel && item.id == rowLogLevel:
+			value = m.loggingLevelEditorView(clock)
 		case m.editID == item.id:
 			value = m.editInput.View()
 		case m.pending && m.pendingRow == item.id && m.pendingNote != "":
@@ -1346,9 +1411,10 @@ func (m *Model) rows() []row {
 	if m.status.Config != nil {
 		configState = fmt.Sprintf("%s · desired %d / observed %d", m.status.Config.Status, m.status.Config.DesiredRevision, m.status.Config.ObservedRevision)
 	}
-	daemon := fmt.Sprintf("Version %s\nUptime %s\nHealth %s\nRevision %d\nConfig %s", valueOr(m.status.DaemonVersion, ui.UnknownLabel), uptime(m.status.StartedAt), valueOr(m.status.Health, ui.UnknownLabel), m.status.Revision, configState)
-	core := fmt.Sprintf("Status %s\nVersion %s\nPID %d\nRestarts %d", valueOr(m.core.Status, ui.UnknownLabel), valueOr(m.core.Version, ui.UnknownLabel), m.core.PID, m.core.Restarts)
+	daemon := fmt.Sprintf("Version %s\n%s\nHealth %s\nRevision %d\nConfig %s", valueOr(m.status.DaemonVersion, ui.UnknownLabel), formatUpSinceDetail(m.status.StartedAt), valueOr(m.status.Health, ui.UnknownLabel), m.status.Revision, configState)
+	core := fmt.Sprintf("Status %s\nVersion %s\nPID %d\nRestarts %d\n%s", valueOr(m.core.Status, ui.UnknownLabel), valueOr(m.core.Version, ui.UnknownLabel), m.core.PID, m.core.Restarts, formatUpSinceDetail(m.core.StartedAt))
 	rows := m.portRows()
+	rows = append(rows, m.networkRows()...)
 	rows = append(rows, row{id: rowDaemon, section: ui.DaemonSectionTitle, label: ui.DaemonLabel, value: daemonValue(m.theme, m.status, !m.mutationsEnabled), detail: daemon})
 	rows = append(rows, m.panelRows()...)
 	rows = append(rows, m.mihariChannelRow())
@@ -1357,11 +1423,10 @@ func (m *Model) rows() []row {
 		row{id: rowRunSetup, section: ui.DaemonSectionTitle, label: ui.RunSetupLabel, detail: ui.RunSetupDetail},
 		row{id: rowCore, section: ui.CoreSectionTitle, label: ui.MihomoCoreLabel, value: coreValue(m.theme, m.core, !m.mutationsEnabled), detail: core},
 		row{id: rowCoreChannel, section: ui.CoreSectionTitle, label: ui.CoreChannelLabel, value: coreChannelName(m.core.Channel), detail: ui.SwitchCoreChannelImpact},
-		row{id: rowCoreUpdate, section: ui.CoreSectionTitle, label: m.coreActionLabel(), value: actionState(m.hasCapability(protocol.CapabilityCore), m.mutationsEnabled), detail: ui.UpdateCoreImpact},
+		row{id: rowCoreUpdate, section: ui.CoreSectionTitle, label: m.coreActionLabel(), value: m.coreUpdateValue(), detail: ui.UpdateCoreImpact},
 		row{id: rowCoreRestart, section: ui.CoreSectionTitle, label: ui.RestartCoreLabel, value: actionState(m.hasCapability(protocol.CapabilityCore), m.mutationsEnabled), detail: ui.RestartCoreImpact},
 	)
 	rows = append(rows, m.serviceRows()...)
-	rows = append(rows, m.networkRows()...)
 	rows = append(rows, m.loggingRows()...)
 	rows = append(rows, m.maintenanceRows()...)
 	rows = append(rows, m.aboutRows()...)
@@ -1383,7 +1448,7 @@ func (m *Model) previewCompleteUninstall() tea.Cmd {
 	}
 	if m.uninstaller == nil {
 		m.markRowOutcome(rowCompleteUninstall, false, ui.CompleteUninstallUnavailable)
-		return nil
+		return m.localFailure("uninstall.preview", ui.CompleteUninstallUnavailable, errors.New("complete uninstallation is unavailable in this session"))
 	}
 	return func() tea.Msg {
 		targets, err := m.uninstaller.Preview(m.ctx)
@@ -1393,7 +1458,7 @@ func (m *Model) previewCompleteUninstall() tea.Cmd {
 
 func uninstallPreviewDetail(err error) string {
 	if msg := strings.TrimSpace(err.Error()); msg != "" {
-		return msg
+		return diagnostics.EscapeTerminal(msg)
 	}
 	return ui.CompleteUninstallPreviewFailed
 }
@@ -1408,17 +1473,30 @@ func uninstallTargetPaths(targets []app.UninstallTarget) string {
 
 func (m *Model) loggingRows() []row {
 	level := ui.UnavailableTitle
+	detail := ui.LoggingLevelHint
+	if m.logging.SyncMessage != "" {
+		detail += " " + m.logging.SyncMessage
+	}
 	maxSize := ui.UnavailableTitle
 	maxFiles := ui.UnavailableTitle
 	directory := ui.UnavailableTitle
 	if m.loggingAvailable {
 		level = m.logging.Level
+		if level == "silent" {
+			level += " (adopted from core)"
+		}
+		switch m.logging.SyncState {
+		case "unsaved":
+			level += fmt.Sprintf(" (core: %s; unsaved)", m.logging.CoreLevel)
+		case "pending", "unknown":
+			level += " (" + m.logging.SyncState + ")"
+		}
 		maxSize = fmt.Sprintf("%d MiB", m.logging.MaxSizeMB)
 		maxFiles = fmt.Sprintf("%d", m.logging.MaxFiles)
 		directory = m.logging.Dir
 	}
 	rows := []row{
-		{id: rowLogLevel, section: ui.LoggingSectionTitle, label: ui.LoggingLevelLabel, value: level},
+		{id: rowLogLevel, section: ui.LoggingSectionTitle, label: ui.LoggingLevelLabel, value: level, detail: detail},
 		{id: rowLogMaxSize, section: ui.LoggingSectionTitle, label: ui.LoggingMaxSizeLabel, value: maxSize},
 		{id: rowLogMaxFiles, section: ui.LoggingSectionTitle, label: ui.LoggingMaxFilesLabel, value: maxFiles},
 	}
@@ -1860,7 +1938,7 @@ func (m *Model) markRowOutcome(rowID string, ok bool, detail string) {
 		m.lastError = ""
 		return
 	}
-	m.outcomeDetail = strings.TrimSpace(detail)
+	m.outcomeDetail = diagnostics.EscapeTerminal(strings.TrimSpace(detail))
 	m.lastError = m.outcomeDetail
 }
 
@@ -2000,7 +2078,7 @@ func rowProgressForAction(action ui.Action, coreMissing bool) (rowID, note strin
 	}
 }
 
-// actionErrorDetail prefers a redacted API message, else the domain fallback.
+// actionErrorDetail selects the row summary; the diagnostic retains the cause.
 func actionErrorDetail(err error, fallback string) string {
 	var apiError protocol.APIError
 	if errors.As(err, &apiError) {
@@ -2215,9 +2293,9 @@ func (m *Model) openPanelBrowser(panelID string) tea.Cmd {
 }
 
 func (m *Model) probePortHolds() tea.Cmd {
-	listen := m.listenFree
-	if listen == nil {
-		listen = ui.ListenFree
+	probe := ui.ProbeListen
+	if listen := m.listenFree; listen != nil {
+		probe = func(addr string) (bool, error) { return listen(addr), nil }
 	}
 	lookup := m.lookupOccupant
 	if lookup == nil {
@@ -2235,19 +2313,23 @@ func (m *Model) probePortHolds() tea.Cmd {
 	}
 	return func() tea.Msg {
 		holds := make(map[string]ui.PortHold, 3)
+		var failures []error
 		for id, addr := range addrs {
 			if strings.TrimSpace(addr) == "" {
 				holds[id] = ui.PortHold{Kind: ui.PortHoldUnknown}
 				continue
 			}
-			free := listen(addr)
+			free, err := probe(addr)
 			var occ platform.TCPOccupant
 			if !free {
 				occ, _ = lookup(addr)
 			}
 			holds[id] = ui.ClassifyPortHold(free, occ.PID, occ.Process, owners[id])
+			if err != nil && !(owners[id] > 0 && occ.PID == owners[id]) {
+				failures = append(failures, fmt.Errorf("probe %s endpoint %q: %w", id, addr, err))
+			}
 		}
-		return portHoldsMsg{holds: holds}
+		return portHoldsMsg{holds: holds, failures: failures}
 	}
 }
 
@@ -2269,25 +2351,6 @@ func (m *Model) beginPortEdit(id string) tea.Cmd {
 
 func (m *Model) loggingMutationAvailable() bool {
 	return m.client != nil && m.mutationsEnabled && m.loggingAvailable && m.hasCapability(protocol.CapabilityLogging)
-}
-
-func (m *Model) cycleLoggingLevel() tea.Cmd {
-	if !m.loggingMutationAvailable() {
-		return nil
-	}
-	next := "debug"
-	switch m.logging.Level {
-	case "debug":
-		next = "info"
-	case "info":
-		next = "warn"
-	case "warn":
-		next = "error"
-	}
-	request := protocol.LoggingUpdateRequest{
-		OperationID: m.newOperationID(), IfRevision: loggingRevisionPointer(m.logging.Revision), Level: &next,
-	}
-	return m.startLoggingUpdate(rowLogLevel, request)
 }
 
 func (m *Model) beginLoggingEdit(id string) tea.Cmd {
@@ -2352,6 +2415,10 @@ func isLoggingRow(rowID string) bool {
 }
 
 func (m *Model) cancelLoggingEdit() tea.Cmd {
+	if m.editID == rowLogLevel {
+		m.clearLoggingOutcome(rowLogLevel)
+		m.loggingLevelCandidate = ""
+	}
 	m.editID = ""
 	m.editInput = textinput.Model{}
 	return func() tea.Msg { return ui.InputModeMsg{Mode: ui.InputNavigation} }
@@ -2367,13 +2434,19 @@ func (m *Model) confirmLoggingEdit() tea.Cmd {
 	case rowLogMaxSize:
 		if err != nil || value < 1 || value > 100 {
 			m.markRowOutcome(rowID, false, ui.LoggingMaxSizeInvalid)
-			return nil
+			if err == nil {
+				err = fmt.Errorf("logging value %q must be between 1 and 100", m.editInput.Value())
+			}
+			return m.localFailure("logging.validate", ui.LoggingMaxSizeInvalid, err)
 		}
 		request.MaxSizeMB = &value
 	case rowLogMaxFiles:
 		if err != nil || value < 1 || value > 10 {
 			m.markRowOutcome(rowID, false, ui.LoggingMaxFilesInvalid)
-			return nil
+			if err == nil {
+				err = fmt.Errorf("logging value %q must be between 1 and 10", m.editInput.Value())
+			}
+			return m.localFailure("logging.validate", ui.LoggingMaxFilesInvalid, err)
 		}
 		request.MaxFiles = &value
 	default:
@@ -2387,6 +2460,7 @@ func (m *Model) startLoggingUpdate(rowID string, request protocol.LoggingUpdateR
 	if !m.loggingMutationAvailable() || m.pending {
 		return nil
 	}
+	m.clearLoggingOutcome(rowID)
 	epoch := m.loggingEpoch
 	operation := logging.OperationMetadata{ID: request.OperationID, Name: "logging.update"}
 	m.pending = true
@@ -2452,7 +2526,7 @@ func (m *Model) confirmPortEdit() tea.Cmd {
 	}
 	if err := ui.ValidateManagedEndpoints(mixed, controller, web); err != nil {
 		m.lastError = ui.InvalidPortEndpoint
-		return nil
+		return m.localFailure("endpoints.validate", ui.InvalidPortEndpoint, err)
 	}
 	occupied := [3]bool{
 		m.portHolds[rowMixed].Kind == ui.PortHoldOccupied,
@@ -2507,7 +2581,7 @@ func (m *Model) openGitHub() tea.Cmd {
 	}
 	if err := openBrowser(ui.AboutGitHubURL); err != nil {
 		m.lastError = ui.AboutGitHubOpenFailed
-		return nil
+		return m.localFailure("browser.open", ui.AboutGitHubOpenFailed, err)
 	}
 	m.lastError = ""
 	return nil
@@ -2588,6 +2662,7 @@ func (m *Model) ensureChannelLoaded() {
 		channel, err := m.selfUpdateChannel(m.ctx)
 		if err != nil {
 			m.mihariChannelFailed = true
+			m.channelDiagnostic = m.localFailure("self.channel.read", ui.MihariChannelFailed, err)
 			return
 		}
 		m.mihariChannel = channel
@@ -2597,11 +2672,13 @@ func (m *Model) ensureChannelLoaded() {
 	path, err := m.channelFilePath()
 	if err != nil {
 		m.mihariChannelFailed = true
+		m.channelDiagnostic = m.localFailure("self.channel.read", ui.MihariChannelFailed, err)
 		return
 	}
 	channel, err := m.readChannel(path)
 	if err != nil {
 		m.mihariChannelFailed = true
+		m.channelDiagnostic = m.localFailure("self.channel.read", ui.MihariChannelFailed, err)
 		return
 	}
 	m.mihariChannel = channel
@@ -3018,6 +3095,13 @@ func uptime(started time.Time) string {
 		duration = 0
 	}
 	return duration.Round(time.Second).String()
+}
+
+func formatUpSinceDetail(started time.Time) string {
+	if started.IsZero() {
+		return ui.UpSinceLabel + " " + ui.MissingValue + " · " + ui.MissingValue
+	}
+	return ui.UpSinceLabel + " " + uptime(started) + " · " + started.Local().Format("2006-01-02 15:04:05")
 }
 
 func valueOr(value, fallback string) string {

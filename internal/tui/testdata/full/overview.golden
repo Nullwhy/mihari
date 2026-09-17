@@ -10,10 +10,10 @@
                  ╭───General─────────────────────────────╮╭───Core────────────────────────────────╮ 
                  │ Service    —                          ││ ● running  v1.19.0 · MEM 0 B          │ 
                  │ Mihari     dev                        ││ 0 conn · ↑0 B  ↓0 B                   │ 
-                 │ SysProxy   —                          ││ UL ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ 0 B/s     │ 
-                 │ TUN        —                          ││ DL ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ 0 B/s     │ 
-                 │ Health     ● All Config Desired and   ││                                       │ 
-                 │            Applied Successfully       ││                                       │ 
+                 │ SysProxy   —                          ││ UL ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ 0 B/s       │ 
+                 │ TUN        —                          ││ DL ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ 0 B/s       │ 
+                 │ Health     ● All Configs Applied      ││ Up Since —  Restarts 0                │ 
+                 │ Up Since   —                          ││                                       │ 
                  ╰───────────────────────────────────────╯╰───────────────────────────────────────╯ 
                  ╭───Subscription────────────────────────╮╭───Web GUI─────────────────────────────╮ 
                  │ Main · 2026-08-03 12:00               ││ Web GUI status unavailable            │ 
@@ -25,4 +25,4 @@
                                                                                                     
                                                                                                     
                                                                                                     
- Esc back  ? help  q quit                                                                           
+ F2 details  Esc back  ? help  q quit                                                               

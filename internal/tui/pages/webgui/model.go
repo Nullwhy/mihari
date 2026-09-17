@@ -4,13 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"slices"
-	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
-	lipgloss "charm.land/lipgloss/v2"
 	"github.com/mihari-proxy/mihari/internal/control/protocol"
+	"github.com/mihari-proxy/mihari/internal/diagnostics"
 	"github.com/mihari-proxy/mihari/internal/logging"
 	"github.com/mihari-proxy/mihari/internal/platform"
 	"github.com/mihari-proxy/mihari/internal/tui/ui"
@@ -29,13 +28,17 @@ type Client interface {
 }
 
 type statusResultMsg struct {
-	status protocol.WebGUIStatus
-	err    error
+	status        protocol.WebGUIStatus
+	err           error
+	checkVersions bool
 }
 
 type mutationDoneMsg struct {
-	operation logging.OperationMetadata
-	err       error
+	changedPanel string
+	pendingKey   string
+	warnings     protocol.WarningOutcome
+	operation    logging.OperationMetadata
+	err          error
 }
 
 // Err implements the shell's action-outcome contract so panel lifecycle
@@ -46,6 +49,7 @@ var _ interface{ Err() error } = mutationDoneMsg{}
 
 // Model is the Web GUI lifecycle page.
 type Model struct {
+	versions       map[string]panelVersionState
 	ctx            context.Context
 	client         Client
 	openBrowser    func(string) error
@@ -53,12 +57,18 @@ type Model struct {
 	available      bool
 	status         protocol.WebGUIStatus
 	selected       int
+	action         int
+	menuOpen       bool
+	menuIndex      int
 	lastError      string
 	toast          string
 	contentFocused bool
 	width          int
 	height         int
 	theme          ui.Theme
+	installing     map[string]bool
+	installClock   time.Time
+	installSpinGen uint64
 }
 
 // New constructs a Web GUI page with background context.
@@ -99,6 +109,8 @@ func (m *Model) SetSize(width, height int) { m.width, m.height = width, height }
 func (m *Model) SetContentFocused(focused bool) { m.contentFocused = focused }
 
 func (m *Model) FocusFirst() {
+	m.action, m.menuIndex = 0, 0
+	m.menuOpen = false
 	if len(m.status.Panels) > 0 {
 		m.selected = 0
 	}
@@ -106,48 +118,98 @@ func (m *Model) FocusFirst() {
 
 func (m *Model) SetCapabilities(capabilities []string) {
 	m.available = slices.Contains(capabilities, protocol.CapabilityWebGUI)
+	if !m.available {
+		m.menuOpen = false
+	}
 }
 
 func (m *Model) SetStatus(status protocol.WebGUIStatus) {
+	previous, hadSelection := m.selectedPanel()
 	status.Panels = append([]protocol.PanelStatus(nil), status.Panels...)
 	m.status = status
+	if hadSelection {
+		index := slices.IndexFunc(status.Panels, func(panel protocol.PanelStatus) bool { return panel.ID == previous.ID })
+		if index >= 0 {
+			m.selected = index
+		} else {
+			m.menuOpen = false
+			m.action = 0
+		}
+	}
 	if m.selected >= len(m.status.Panels) {
 		m.selected = max(0, len(m.status.Panels)-1)
+	}
+	if panel, ok := m.selectedPanel(); !ok || panel.InstalledBuild == "" {
+		m.action = 0
+		m.menuOpen = false
 	}
 }
 
 // FooterHints returns contextual shortcuts for the root shell footer.
 func (m *Model) FooterHints() string {
-	return ui.RenderFooter(m.ID(), "", ui.FooterOpt{WebGUIAvailable: m.available})
+	return ui.RenderFooter(m.ID(), m.HelpMode(), ui.FooterOpt{WebGUIAvailable: m.available})
 }
 
 func (m *Model) Load() tea.Cmd {
+	return m.load(true)
+}
+
+func (m *Model) load(checkVersions bool) tea.Cmd {
 	if !m.available || m.client == nil {
 		return nil
 	}
 	return func() tea.Msg {
 		status, err := m.client.WebGUI(m.ctx)
-		return statusResultMsg{status: status, err: err}
+		return ui.PageResultMsg{Page: ui.PageWebGUI, Result: statusResultMsg{status: status, err: err, checkVersions: checkVersions}}
 	}
 }
 
 func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 	switch typed := message.(type) {
+	case panelVersionMsg:
+		state, ok := m.versions[typed.id]
+		if !ok || typed.generation != state.generation {
+			return m, nil
+		}
+		state.latest, state.checking, state.failed = typed.result.Latest, false, typed.err != nil || typed.result.Latest == ""
+		if !state.failed {
+			state.checkedAt = time.Now()
+		}
+		m.versions[typed.id] = state
+		return m, nil
+	case ui.ActionPendingMsg:
+		return m, m.beginInstall(typed)
+	case installSpinTickMsg:
+		if typed.gen != m.installSpinGen || len(m.installing) == 0 {
+			return m, nil
+		}
+		m.installClock = typed.at
+		return m, m.installTick()
 	case statusResultMsg:
 		if typed.err != nil {
 			m.lastError = ui.WebGUIUnavailable
 		} else {
 			m.lastError = ""
 			m.SetStatus(typed.status)
+			if typed.checkVersions {
+				return m, m.checkPanelVersions()
+			}
 		}
 		return m, nil
 	case mutationDoneMsg:
+		delete(m.installing, typed.pendingKey)
 		if typed.err != nil {
-			m.toast = typed.err.Error()
+			m.toast = diagnostics.EscapeTerminal(typed.err.Error())
 		} else {
 			m.toast = ""
+			if typed.changedPanel != "" {
+				if m.versions != nil {
+					m.versions[typed.changedPanel] = panelVersionState{generation: m.versions[typed.changedPanel].generation + 1}
+				}
+				return m, tea.Batch(m.load(false), m.checkPanelVersion(typed.changedPanel))
+			}
 		}
-		return m, m.Load()
+		return m, m.load(false)
 	case tea.KeyPressMsg:
 		if !m.available {
 			if typed.String() == "esc" {
@@ -161,20 +223,47 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 }
 
 func (m *Model) handleKey(name string) tea.Cmd {
+	if m.menuOpen {
+		return m.handleMenuKey(name)
+	}
 	switch name {
 	case "esc":
 		return func() tea.Msg { return ui.FocusRailMsg{} }
 	case "up", "k":
 		if m.selected > 0 {
 			m.selected--
+			m.action = 0
 		}
 	case "down", "j":
 		if m.selected+1 < len(m.status.Panels) {
 			m.selected++
+			m.action = 0
 		}
+	case "tab", "right":
+		m.moveAction(1)
+	case "shift+tab", "left":
+		m.moveAction(-1)
+	case "enter":
+		panel, ok := m.selectedPanel()
+		if !ok {
+			return nil
+		}
+		if panel.InstalledBuild == "" {
+			return m.installSelected()
+		}
+		if m.action == 0 {
+			return m.openBrowserAction()
+		}
+		m.menuOpen, m.menuIndex = true, 0
 	case "space":
+		if panel, ok := m.selectedPanel(); !ok || panel.InstalledBuild == "" {
+			return nil
+		}
 		return m.activateSelected()
 	case "o":
+		if panel, ok := m.selectedPanel(); !ok || panel.InstalledBuild == "" {
+			return nil
+		}
 		return m.openBrowserAction()
 	case "i":
 		return m.installSelected()
@@ -211,8 +300,8 @@ func (m *Model) activateSelected() tea.Cmd {
 			Key: "panel:activate:" + panel.ID, Title: ui.ActivatePanelTitle, Object: panel.Name,
 			Impact: ui.ActivatePanelImpact, Rollback: ui.ActivatePanelRollback,
 			Execute: func() tea.Msg {
-				_, err := m.client.ActivatePanel(ctx, panel.ID, protocol.MutationRequest{OperationID: operationID})
-				return mutationDoneMsg{operation: operation, err: err}
+				result, err := m.client.ActivatePanel(ctx, panel.ID, protocol.MutationRequest{OperationID: operationID})
+				return mutationDoneMsg{operation: operation, err: err, warnings: result.WarningOutcome}
 			},
 		}
 	}
@@ -232,8 +321,8 @@ func (m *Model) installSelected() tea.Cmd {
 			Key: "panel:install:" + panel.ID, Title: ui.InstallPanelTitle, Object: panel.Name,
 			Impact: ui.InstallPanelImpact, Rollback: ui.InstallPanelRollback,
 			Execute: func() tea.Msg {
-				_, err := m.client.InstallPanel(ctx, panel.ID, protocol.PanelInstallRequest{OperationID: operationID})
-				return mutationDoneMsg{operation: operation, err: err}
+				result, err := m.client.InstallPanel(ctx, panel.ID, protocol.PanelInstallRequest{OperationID: operationID})
+				return mutationDoneMsg{changedPanel: panel.ID, pendingKey: "panel:install:" + panel.ID, operation: operation, err: err, warnings: result.WarningOutcome}
 			},
 		}
 	}
@@ -253,8 +342,8 @@ func (m *Model) updateSelected() tea.Cmd {
 			Key: "panel:update:" + panel.ID, Title: ui.UpdatePanelTitle, Object: panel.Name,
 			Impact: ui.UpdatePanelImpact, Rollback: ui.UpdatePanelRollback,
 			Execute: func() tea.Msg {
-				_, err := m.client.UpdatePanel(ctx, panel.ID, protocol.MutationRequest{OperationID: operationID})
-				return mutationDoneMsg{operation: operation, err: err}
+				result, err := m.client.UpdatePanel(ctx, panel.ID, protocol.MutationRequest{OperationID: operationID})
+				return mutationDoneMsg{changedPanel: panel.ID, operation: operation, err: err, warnings: result.WarningOutcome}
 			},
 		}
 	}
@@ -274,8 +363,8 @@ func (m *Model) rollbackSelected() tea.Cmd {
 			Key: "panel:rollback:" + panel.ID, Title: ui.RollbackPanelTitle, Object: panel.Name,
 			Impact: ui.RollbackPanelImpact, Rollback: ui.RollbackPanelRollback,
 			Execute: func() tea.Msg {
-				_, err := m.client.RollbackPanel(ctx, panel.ID, protocol.MutationRequest{OperationID: operationID})
-				return mutationDoneMsg{operation: operation, err: err}
+				result, err := m.client.RollbackPanel(ctx, panel.ID, protocol.MutationRequest{OperationID: operationID})
+				return mutationDoneMsg{changedPanel: panel.ID, operation: operation, err: err, warnings: result.WarningOutcome}
 			},
 		}
 	}
@@ -301,8 +390,8 @@ func (m *Model) uninstallSelected() tea.Cmd {
 			Key: "panel:uninstall:" + panel.ID, Title: ui.UninstallPanelTitle, Object: panel.Name,
 			Impact: ui.UninstallPanelImpact, Rollback: ui.UninstallPanelRollback,
 			Execute: func() tea.Msg {
-				_, err := m.client.UninstallPanel(ctx, panel.ID, protocol.MutationRequest{OperationID: operationID})
-				return mutationDoneMsg{operation: operation, err: err}
+				result, err := m.client.UninstallPanel(ctx, panel.ID, protocol.MutationRequest{OperationID: operationID})
+				return mutationDoneMsg{changedPanel: panel.ID, operation: operation, err: err, warnings: result.WarningOutcome}
 			},
 		}
 	}
@@ -322,8 +411,8 @@ func (m *Model) reinstallSelected() tea.Cmd {
 			Key: "panel:reinstall:" + panel.ID, Title: ui.ReinstallPanelTitle, Object: panel.Name,
 			Impact: ui.ReinstallPanelImpact, Rollback: ui.ReinstallPanelRollback,
 			Execute: func() tea.Msg {
-				_, err := m.client.ReinstallPanel(ctx, panel.ID, protocol.MutationRequest{OperationID: operationID})
-				return mutationDoneMsg{operation: operation, err: err}
+				result, err := m.client.ReinstallPanel(ctx, panel.ID, protocol.MutationRequest{OperationID: operationID})
+				return mutationDoneMsg{changedPanel: panel.ID, pendingKey: "panel:reinstall:" + panel.ID, operation: operation, err: err, warnings: result.WarningOutcome}
 			},
 		}
 	}
@@ -373,71 +462,6 @@ func (m *Model) layoutWidth() int {
 	return 100
 }
 
-func (m *Model) View() string {
-	inner := ui.FullSectionInner(m.layoutWidth())
-	if !m.available {
-		body := m.theme.Muted.Render(ui.UnavailableTitle + ": " + ui.WebGUILifecycleUnavailable)
-		return ui.RenderBorderedSection(m.theme, ui.WebGUITitle, body, inner)
-	}
-	active := valueOr(m.status.ActivePanel, ui.MissingValue)
-	// Summary lines: health+addr, Active panel + sessions, then a cache-refresh
-	// hint in the same body style. OpenBrowserHint stays in the footer (the o key).
-	textW := ui.SectionTextWidth(inner)
-	line1 := ui.TruncateVisible(valueOr(m.status.GatewayHealth, ui.UnknownLabel)+"  "+valueOr(m.status.GatewayAddr, ui.MissingValue), textW)
-	line2 := ui.TruncateVisible(fmt.Sprintf("%s %s  ·  %s %d", ui.ActivePanelLabel, active, ui.BrowserSessionsLabel, m.status.BrowserSessions), textW)
-	header := line1 + "\n" + line2 + "\n" + wrapPlain(ui.WebGUICacheRefreshHint, textW)
-	var parts []string
-	parts = append(parts, ui.RenderBorderedSection(m.theme, ui.WebGUITitle, header, inner))
-
-	if len(m.status.Panels) == 0 {
-		parts = append(parts, ui.RenderBorderedSection(m.theme, "Panels", m.theme.Muted.Render(ui.NoWebGUIPanels), inner))
-	}
-	for index, panel := range m.status.Panels {
-		state := ""
-		if panel.Active {
-			state = "  " + ui.ActiveLabel
-		}
-		selected := index == m.selected
-		marker := "  "
-		if selected {
-			marker = ui.FocusMarker
-		}
-		body := fmt.Sprintf("%sInstalled  %s\n  Latest     %s\n  Health     %s\n  Rollback   %s",
-			marker, valueOr(panel.InstalledBuild, ui.MissingValue), valueOr(panel.LatestBuild, ui.MissingValue),
-			valueOr(panel.Health, ui.UnknownLabel), valueOr(panel.RollbackBuild, ui.MissingValue))
-		title := valueOr(panel.Name, panel.ID) + state
-		border := m.theme.ColorSurfaceBorder
-		// Accent the focused panel only while content owns keyboard focus.
-		if selected && m.contentFocused {
-			border = m.theme.ColorAccent
-		}
-		parts = append(parts, ui.RenderBorderedSectionWithBorder(m.theme, title, body, inner, border))
-	}
-	safeguards := []string{
-		boolState("Loopback binding", m.status.Safeguards.LoopbackBound),
-		boolState("Browser authentication", m.status.Safeguards.BrowserAuthenticated),
-		boolState("Controller isolation", m.status.Safeguards.ControllerIsolated),
-		boolState("Mutation coordinator", m.status.Safeguards.MutationsCoordinated),
-	}
-	// 2×2 layout (design W1); each line clips to the section text width.
-	row1 := ui.TruncateVisible(safeguards[0]+"  "+safeguards[1], textW)
-	row2 := ui.TruncateVisible(safeguards[2]+"  "+safeguards[3], textW)
-	parts = append(parts, ui.RenderBorderedSection(m.theme, ui.GatewaySafeguardsTitle, row1+"\n"+row2, inner))
-	if m.lastError != "" {
-		parts = append(parts, m.lastError)
-	}
-	if m.toast != "" {
-		parts = append(parts, m.toast)
-	}
-	// Never render auth tokens or open URLs.
-	view := strings.Join(parts, "\n")
-	lower := strings.ToLower(view)
-	if strings.Contains(lower, "token=") || strings.Contains(lower, "open_url") {
-		return ui.RenderBorderedSection(m.theme, ui.WebGUITitle, ui.WebGUIUnavailable, inner)
-	}
-	return view
-}
-
 func boolState(label string, enabled bool) string {
 	state := ui.OffLabel
 	if enabled {
@@ -451,13 +475,6 @@ func valueOr(value, fallback string) string {
 		return fallback
 	}
 	return value
-}
-
-func wrapPlain(text string, width int) string {
-	if width < 1 || lipgloss.Width(text) <= width {
-		return text
-	}
-	return lipgloss.NewStyle().Width(width).Render(text)
 }
 
 func randomOperationID() string {

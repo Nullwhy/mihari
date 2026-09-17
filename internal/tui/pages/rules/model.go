@@ -43,8 +43,9 @@ type pageFocus struct {
 }
 
 type detailState struct {
-	title string
-	body  string
+	title  string
+	body   string
+	scroll int
 }
 
 type Model struct {
@@ -84,6 +85,7 @@ type providersResultMsg struct {
 }
 
 type providerUpdateResultMsg struct {
+	warnings  protocol.WarningOutcome
 	operation logging.OperationMetadata
 	name      string
 	revision  uint64
@@ -91,6 +93,7 @@ type providerUpdateResultMsg struct {
 }
 
 type providersUpdateAllResultMsg struct {
+	warnings   protocol.WarningOutcome
 	operations []logging.OperationMetadata
 	revision   uint64
 	err        error
@@ -217,6 +220,10 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 		return m, m.reloadProviders()
 	}
 
+	if key, ok := message.(tea.KeyPressMsg); ok && key.String() == "ctrl+f" {
+		cmd, _ := m.FocusSearch()
+		return m, cmd
+	}
 	if m.searching {
 		return m.updateSearch(message)
 	}
@@ -230,9 +237,7 @@ func (m *Model) Update(message tea.Msg) (ui.Page, tea.Cmd) {
 		return m, nil
 	}
 	if m.detail != nil {
-		if key.String() == "esc" || key.String() == "enter" {
-			m.detail = nil
-		}
+		m.updateDetail(key.String())
 		return m, nil
 	}
 	switch key.String() {
@@ -334,7 +339,7 @@ func (m *Model) View() string {
 
 	content := controls + "\n" + list + "\n" + listStatus
 	if m.detail != nil {
-		content += "\n\n" + m.theme.Dialog.Render(m.theme.Title.Render(m.detail.title)+"\n\n"+m.detail.body+"\n\n"+ui.EscCloseHint)
+		return m.renderDetail(content)
 	}
 	return content
 }
@@ -607,7 +612,7 @@ func (m *Model) openDetail() {
 		}
 		index := indexes[m.focus.row]
 		rule := m.rules[index]
-		m.detail = &detailState{title: ui.RuleDetailsTitle, body: fmt.Sprintf("%s: %d\n%s: %s\n%s: %s\n%s: %s", ui.EvaluationOrderLabel, index+1, ui.TypeLabel, rule.Type, ui.PayloadLabel, valueOr(rule.Payload, ui.MissingValue), ui.TargetLabel, rule.Proxy)}
+		m.detail = &detailState{title: ui.RuleDetailsTitle, body: fmt.Sprintf("%s: %d\n%s: %s\n%s: %s\n\n%s\n%s", ui.EvaluationOrderLabel, index+1, ui.TypeLabel, ui.StyleRuleType(m.theme, rule.Type), ui.TargetLabel, ui.StyleProxyTarget(m.theme, rule.Proxy), m.theme.Muted.Render(ui.PayloadLabel), valueOr(rule.Payload, ui.MissingValue))}
 		return
 	}
 	indexes := m.visibleProviderIndexes()
@@ -683,6 +688,14 @@ func (m *Model) updateSearch(message tea.Msg) (ui.Page, tea.Cmd) {
 	return m, nil
 }
 
+// FocusSearch focuses the query at its end unless a page dialog owns input.
+func (m *Model) FocusSearch() (tea.Cmd, bool) {
+	if m.detail != nil {
+		return nil, false
+	}
+	return m.startSearch(), true
+}
+
 func (m *Model) startSearch() tea.Cmd {
 	m.searching = true
 	m.focus = pageFocus{kind: focusSearch}
@@ -735,7 +748,7 @@ func (m *Model) updateFocusedProvider() tea.Cmd {
 			request.IfRevision = &revision
 		}
 		result, err := m.client.UpdateRuleProvider(logging.WithOperation(ctx, operation), name, request)
-		return providerUpdateResultMsg{operation: operation, name: name, revision: result.Revision, err: err}
+		return providerUpdateResultMsg{warnings: result.WarningOutcome, operation: operation, name: name, revision: result.Revision, err: err}
 	}
 }
 
@@ -754,6 +767,7 @@ func (m *Model) updateAllProviders() tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(max(1, len(names)))*30*time.Second)
 		defer cancel()
 		operations := make([]logging.OperationMetadata, 0, len(names))
+		var warnings protocol.WarningOutcome
 		for index, name := range names {
 			request := protocol.MutationRequest{OperationID: fmt.Sprintf("%s-%d", baseID, index+1)}
 			if revision != 0 {
@@ -762,14 +776,15 @@ func (m *Model) updateAllProviders() tea.Cmd {
 			operation := logging.OperationMetadata{ID: request.OperationID, Name: "rule_provider.refresh"}
 			operations = append(operations, operation)
 			result, err := m.client.UpdateRuleProvider(logging.WithOperation(ctx, operation), name, request)
+			warnings.Append(result.WarningOutcome)
 			if err != nil {
-				return providersUpdateAllResultMsg{operations: operations, revision: revision, err: err}
+				return providersUpdateAllResultMsg{warnings: warnings, operations: operations, revision: revision, err: err}
 			}
 			if result.Revision != 0 {
 				revision = result.Revision
 			}
 		}
-		return providersUpdateAllResultMsg{operations: operations, revision: revision}
+		return providersUpdateAllResultMsg{warnings: warnings, operations: operations, revision: revision}
 	}
 }
 

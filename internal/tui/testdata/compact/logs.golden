@@ -1,6 +1,6 @@
  Mihari  ·  ●  ·  0c  ·  ↑     0/s ↓     0/s  ·  0              Offline 
    1 Overview  ╭───Controls───────────────────────────────────────────╮ 
-   2 Proxies   │ Level: ALL  Wrap: ● Off  Pause: ● Off  Export        │ 
+   2 Proxies   │ Level: DEBUG+  Wrap: ● Off  Pause: ● Off  Export     │ 
    3 Conns     │ / Search…                                            │ 
    4 Rules     ╰──────────────────────────────────────────────────────╯ 
  › 5 Logs      ╭───Logs───────────────────────────────────────────────╮ 
@@ -19,4 +19,4 @@
                                                                         
                                                                         
                                                                         
- Esc back  / search  p pause  w wrap  G newest  ? help  q quit          
+ F2 details  Esc back  / search · Ctrl+F  p pause  ? help  q quit       

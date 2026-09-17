@@ -25,8 +25,16 @@ const (
 	ModeRouting   = "routing"
 	ModeForm      = "form"
 	ModePortsEdit = "ports-edit"
+	// ModePanelMenu identifies Web GUI lifecycle actions for the selected panel.
+	ModePanelMenu = "panel-menu"
 	// ModeLoggingEdit identifies numeric Logging settings text input.
 	ModeLoggingEdit = "logging-edit"
+	// ModeLoggingLevel identifies the inline logging level selector.
+	ModeLoggingLevel = "logging-level"
+	// ModeLoggingApplying identifies a submitted logging level change.
+	ModeLoggingApplying = "logging-applying"
+	// ModeLogFilter identifies the Logs page display-level multi-select dialog.
+	ModeLogFilter = "log-filter"
 	// ModeExportLogs identifies the shared log export overlay.
 	ModeExportLogs = "export-logs"
 	ModeConfirm    = "confirm"
@@ -63,6 +71,7 @@ type FooterOpt struct {
 // the same physical key may appear more than once with different labels.
 func Catalog() []KeyBinding {
 	return []KeyBinding{
+		{Keys: []string{"f2"}, Display: "F2", Label: "diagnostic history and error details", Footer: "F2 details", Scope: ScopeGlobal},
 		{Keys: []string{"up", "down"}, Display: "↑/↓", Label: "select a routing mode", Footer: "↑/↓ select", Scope: ScopeMode, Mode: ModeRouting},
 		{Keys: []string{"enter"}, Display: "Enter", Label: "apply the selected mode", Footer: "Enter apply", Scope: ScopeMode, Mode: ModeRouting},
 		{Keys: []string{"esc"}, Display: "Esc", Label: "cancel mode selection", Footer: "Esc cancel", Scope: ScopeMode, Mode: ModeRouting},
@@ -82,7 +91,8 @@ func Catalog() []KeyBinding {
 		{Keys: []string{"ctrl+t"}, Display: "Ctrl+T", Label: "test all", Footer: "Ctrl+T test all", Scope: ScopePage, Page: PageProxies},
 		{Keys: []string{"up", "down", "left", "right"}, Display: "↑/↓/←/→", Label: "move; at a group header, → focuses Locate and ← returns to the header", Scope: ScopePage, Page: PageProxies},
 
-		{Keys: []string{"/"}, Display: "/", Label: "search", Footer: "/ search", Scope: ScopePage, Page: PageConnections},
+		{Keys: []string{"/"}, Display: "/", Label: "search from page content", Footer: "/ search · Ctrl+F", Scope: ScopePage, Page: PageConnections},
+		{Keys: []string{"ctrl+f"}, Display: "Ctrl+F", Label: "focus search from the rail or page content", Scope: ScopePage, Page: PageConnections},
 		{Keys: []string{"x"}, Display: "x", Label: "close the focused connection", Footer: "x close", Scope: ScopePage, Page: PageConnections},
 		{Keys: []string{"p"}, Display: "p", Label: "pause or resume", Footer: "p pause", Scope: ScopePage, Page: PageConnections},
 		{Keys: []string{"enter"}, Display: "Enter", Label: "open details or activate a control", Footer: "Enter details", Scope: ScopePage, Page: PageConnections},
@@ -90,14 +100,16 @@ func Catalog() []KeyBinding {
 		{Keys: []string{"tab"}, Display: "Tab", Label: "move between controls", Scope: ScopePage, Page: PageConnections},
 		{Keys: []string{"up", "down", "left", "right"}, Display: "↑/↓/←/→", Label: "move", Scope: ScopePage, Page: PageConnections},
 
-		{Keys: []string{"/"}, Display: "/", Label: "search", Footer: "/ search", Scope: ScopePage, Page: PageRules},
+		{Keys: []string{"/"}, Display: "/", Label: "search from page content", Footer: "/ search · Ctrl+F", Scope: ScopePage, Page: PageRules},
+		{Keys: []string{"ctrl+f"}, Display: "Ctrl+F", Label: "focus search from the rail or page content", Scope: ScopePage, Page: PageRules},
 		{Keys: []string{"r"}, Display: "r", Label: "reload", Footer: "r reload", Scope: ScopePage, Page: PageRules},
 		{Keys: []string{"u"}, Display: "u", Label: "update the focused provider", Footer: "u update", Scope: ScopePage, Page: PageRules},
 		{Keys: []string{"ctrl+u"}, Display: "Ctrl+U", Label: "update all providers", Footer: "Ctrl+U update all", Scope: ScopePage, Page: PageRules},
 		{Keys: []string{"enter"}, Display: "Enter", Label: "open details or activate a control", Footer: "Enter details", Scope: ScopePage, Page: PageRules},
 		{Keys: []string{"up", "down", "left", "right"}, Display: "↑/↓/←/→", Label: "move", Scope: ScopePage, Page: PageRules},
 
-		{Keys: []string{"/"}, Display: "/", Label: "search", Footer: "/ search", Scope: ScopePage, Page: PageLogs},
+		{Keys: []string{"/"}, Display: "/", Label: "search from page content", Footer: "/ search · Ctrl+F", Scope: ScopePage, Page: PageLogs},
+		{Keys: []string{"ctrl+f"}, Display: "Ctrl+F", Label: "focus search from the rail or page content", Scope: ScopePage, Page: PageLogs},
 		{Keys: []string{"p"}, Display: "p", Label: "pause or resume", Footer: "p pause", Scope: ScopePage, Page: PageLogs},
 		{Keys: []string{"w"}, Display: "w", Label: "wrap", Footer: "w wrap", Scope: ScopePage, Page: PageLogs},
 		{Keys: []string{"G"}, Display: "G", Label: "jump to newest", Footer: "G newest", Scope: ScopePage, Page: PageLogs},
@@ -116,6 +128,8 @@ func Catalog() []KeyBinding {
 		{Keys: []string{"up", "down"}, Display: "↑/↓", Label: "move", Scope: ScopePage, Page: PageSubscriptions},
 
 		{Keys: []string{"up", "down", "k", "j"}, Display: "↑/↓", Label: "select a panel", Footer: "↑/↓ panel", Scope: ScopePage, Page: PageWebGUI},
+		{Keys: []string{"tab", "shift+tab", "left", "right"}, Display: "Tab/Shift+Tab/←/→", Label: "move between panel actions", Footer: "Tab move", Scope: ScopePage, Page: PageWebGUI},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "activate the focused action", Footer: "Enter activate", Scope: ScopePage, Page: PageWebGUI},
 		{Keys: []string{"space"}, Display: "Space", Label: "set default", Footer: "Space set default", Scope: ScopePage, Page: PageWebGUI},
 		{Keys: []string{"o"}, Display: "o", Label: "open", Footer: "o open", Scope: ScopePage, Page: PageWebGUI},
 		{Keys: []string{"i"}, Display: "i", Label: "install", Footer: "i install", Scope: ScopePage, Page: PageWebGUI},
@@ -127,14 +141,21 @@ func Catalog() []KeyBinding {
 		{Keys: []string{"enter"}, Display: "Enter", Label: "activate the focused row", Footer: "Enter activate", Scope: ScopePage, Page: PageSystem},
 		{Keys: []string{"up", "down"}, Display: "↑/↓", Label: "move", Scope: ScopePage, Page: PageSystem},
 
+		{Keys: []string{"up", "down"}, Display: "↑/↓", Label: "select a level", Footer: "↑/↓ level", Scope: ScopeMode, Mode: ModeLogFilter},
+		{Keys: []string{"space"}, Display: "Space", Label: "toggle the selected level or Select all", Footer: "Space toggle", Scope: ScopeMode, Mode: ModeLogFilter},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "apply selected levels", Footer: "Enter apply", Scope: ScopeMode, Mode: ModeLogFilter},
+		{Keys: []string{"esc"}, Display: "Esc", Label: "discard level selection", Footer: "Esc cancel", Scope: ScopeMode, Mode: ModeLogFilter},
 		{Display: "type", Label: "filter the list", Footer: "Type to filter", Scope: ScopeMode, Mode: ModeSearch},
 		{Keys: []string{"left", "right"}, Display: "←/→", Label: "move cursor", Footer: "←/→ cursor", Scope: ScopeMode, Mode: ModeSearch},
 		{Keys: []string{"up", "down"}, Display: "↑/↓", Label: "leave the field", Footer: "↑/↓ leave", Scope: ScopeMode, Mode: ModeSearch},
 		{Keys: []string{"esc"}, Display: "Esc", Label: "finish search", Footer: "Esc done", Scope: ScopeMode, Mode: ModeSearch},
 
 		{Keys: []string{"enter", "esc"}, Display: "Enter / Esc", Label: "close", Footer: "Enter/Esc close", Scope: ScopeMode, Mode: ModeDetail},
-		{Keys: []string{"left", "right"}, Display: "←/→", Label: "switch tabs", Scope: ScopePage, Page: PageConnections, Mode: ModeDetail},
-		{Keys: []string{"up", "down"}, Display: "↑/↓", Label: "scroll", Scope: ScopePage, Page: PageConnections, Mode: ModeDetail},
+		{Keys: []string{"up", "down"}, Display: "↑/↓", Label: "scroll", Footer: "↑/↓ scroll", Scope: ScopePage, Page: PageConnections, Mode: ModeDetail},
+		{Keys: []string{"up", "down", "pgup", "pgdown", "home", "end"}, Display: "↑/↓ PgUp/PgDn Home/End", Label: "scroll rule details", Footer: "↑/↓ PgUp/PgDn scroll", Scope: ScopePage, Page: PageRules, Mode: ModeDetail},
+		{Keys: []string{"up", "down", "tab", "shift+tab"}, Display: "↑/↓ Tab", Label: "choose an action", Footer: "↑/↓ choose", Scope: ScopePage, Page: PageWebGUI, Mode: ModePanelMenu},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "apply the selected action", Footer: "Enter apply", Scope: ScopePage, Page: PageWebGUI, Mode: ModePanelMenu},
+		{Keys: []string{"esc"}, Display: "Esc", Label: "close the menu", Footer: "Esc close", Scope: ScopePage, Page: PageWebGUI, Mode: ModePanelMenu},
 
 		{Keys: []string{"up", "down"}, Display: "↑/↓", Label: "move", Footer: "↑/↓ column", Scope: ScopeMode, Mode: ModeColumns},
 		{Keys: []string{"space"}, Display: "Space", Label: "toggle", Footer: "Space toggle", Scope: ScopeMode, Mode: ModeColumns},
@@ -172,6 +193,10 @@ func Catalog() []KeyBinding {
 		{Keys: []string{"esc"}, Display: "Esc", Label: "cancel", Footer: "Esc cancel", Scope: ScopeMode, Mode: ModePortsEdit},
 
 		{Display: "type", Label: "edit the value", Footer: "Type value", Scope: ScopeMode, Mode: ModeLoggingEdit},
+		{Keys: []string{"left", "right"}, Display: "←/→", Label: "select a logging level", Footer: "←/→ select", Scope: ScopeMode, Mode: ModeLoggingLevel},
+		{Keys: []string{"enter"}, Display: "Enter", Label: "apply the selected level", Footer: "Enter apply", Scope: ScopeMode, Mode: ModeLoggingLevel},
+		{Keys: []string{"esc"}, Display: "Esc", Label: "discard the selected level", Footer: "Esc cancel", Scope: ScopeMode, Mode: ModeLoggingLevel},
+		{Display: "Wait", Label: "Applying… Editing is locked until the request finishes.", Footer: "Applying…", Scope: ScopeMode, Mode: ModeLoggingApplying},
 		{Keys: []string{"enter"}, Display: "Enter", Label: "apply", Footer: "Enter apply", Scope: ScopeMode, Mode: ModeLoggingEdit},
 		{Keys: []string{"esc"}, Display: "Esc", Label: "cancel", Footer: "Esc cancel", Scope: ScopeMode, Mode: ModeLoggingEdit},
 
@@ -234,32 +259,36 @@ func RenderRailFooter() string {
 	tokens := footerTokens(func(b KeyBinding) bool {
 		return b.Scope == ScopeGlobal && (b.Footer == "↑/↓ page" || b.Footer == "Enter open")
 	})
-	return joinFooter(append(tokens, helpQuitTokens()...))
+	return joinFooter(append([]string{globalFooterToken("F2")}, append(tokens, helpQuitTokens()...)...))
 }
 
 // RenderFooter builds the one-line shortcut hint for a page and overlay mode.
 // Empty mode is the page default. FooterOpt selects state-dependent recipes such
 // as Web GUI availability.
 func RenderFooter(page PageID, mode string, opt FooterOpt) string {
+	return joinFooter([]string{globalFooterToken("F2"), renderPageFooter(page, mode, opt)})
+}
+
+func renderPageFooter(page PageID, mode string, opt FooterOpt) string {
 	helpQuit := helpQuitTokens()
 	escBack := globalFooterToken("Esc")
 	switch mode {
 	case ModeSubscriptionInput, ModeSubscriptionSubmit, ModeSubscriptionSaving, ModeSubscriptionCycle, ModeSubscriptionUnknown, ModeSubscriptionWaiting, ModeSubscriptionConfirm:
 		return joinFooter(footerTokens(func(b KeyBinding) bool { return b.Mode == mode }))
-	case ModeSearch:
+	case ModeSearch, ModeLogFilter:
 		tokens := footerTokens(func(b KeyBinding) bool {
 			return b.Mode == mode && (b.Page == "" || b.Page == page)
 		})
 		return joinFooter(tokens)
-	case ModeDetail, ModeColumns, ModePortsEdit, ModeRouting:
+	case ModeDetail, ModeColumns, ModePortsEdit, ModeRouting, ModePanelMenu:
 		tokens := footerTokens(func(b KeyBinding) bool {
 			return b.Mode == mode && (b.Page == "" || b.Page == page)
 		})
 		return joinFooter(append(tokens, helpQuit...))
 	case ModeForm:
 		return joinFooter(footerTokens(func(b KeyBinding) bool { return b.Mode == ModeForm }))
-	case ModeLoggingEdit:
-		return joinFooter(footerTokens(func(b KeyBinding) bool { return b.Mode == ModeLoggingEdit }))
+	case ModeLoggingEdit, ModeLoggingLevel, ModeLoggingApplying:
+		return joinFooter(footerTokens(func(b KeyBinding) bool { return b.Mode == mode }))
 	case ModeExportLogs:
 		return joinFooter(footerTokens(func(b KeyBinding) bool { return b.Mode == ModeExportLogs }))
 	default:
@@ -270,6 +299,12 @@ func RenderFooter(page PageID, mode string, opt FooterOpt) string {
 		}
 		if page == PageWebGUI && !opt.WebGUIAvailable {
 			return joinFooter(append([]string{escBack}, helpQuit...))
+		}
+		if page == PageWebGUI {
+			tokens := footerTokens(func(b KeyBinding) bool {
+				return b.Page == page && b.Mode == "" && (b.Display == "↑/↓" || b.Display == "Tab/Shift+Tab/←/→" || b.Display == "Enter" || b.Display == "o")
+			})
+			return joinFooter(append(append([]string{escBack}, tokens...), helpQuit...))
 		}
 		tokens := footerTokens(func(b KeyBinding) bool {
 			return b.Scope == ScopePage && b.Page == page && b.Mode == ""
@@ -338,7 +373,7 @@ func RenderHelp(active PageID, mode string) string {
 
 	subscriptionOverlay := active == PageSubscriptions && (mode == ModeForm || strings.HasPrefix(mode, "subscription-"))
 	write("Global", filter(cat, func(x KeyBinding) bool {
-		return x.Scope == ScopeGlobal && (!subscriptionOverlay || x.Display == "Ctrl+C")
+		return x.Scope == ScopeGlobal && (!subscriptionOverlay || x.Display == "Ctrl+C" || x.Display == "F2")
 	}))
 
 	if mode != "" && mode != ModeSetup {
@@ -364,12 +399,16 @@ func modeTitle(mode string) string {
 	switch mode {
 	case ModeRouting:
 		return "Routing Mode"
+	case ModePanelMenu:
+		return "Panel management"
 	case ModeSearch:
 		return "Search"
 	case ModeDetail:
 		return "Detail"
 	case ModeColumns:
 		return "Columns"
+	case ModeLogFilter:
+		return "Log levels"
 	case ModeForm:
 		return "Form"
 	case ModeSubscriptionInput:
@@ -390,6 +429,10 @@ func modeTitle(mode string) string {
 		return "Ports edit"
 	case ModeLoggingEdit:
 		return "Logging edit"
+	case ModeLoggingLevel:
+		return "Logging level"
+	case ModeLoggingApplying:
+		return "Applying logging level"
 	case ModeExportLogs:
 		return "Export logs"
 	case ModeConfirm:
